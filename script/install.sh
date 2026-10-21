@@ -280,7 +280,7 @@ install_v2node() {
             exit 1
         fi
     else
-    last_version=$version_param
+        last_version="v${version_param#v}"
         url="https://github.com/gunzi-666/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
         curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
         if [[ $? -ne 0 ]]; then

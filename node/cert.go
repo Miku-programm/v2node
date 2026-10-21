@@ -67,6 +67,23 @@ func (c *Controller) requestCert() error {
 		if err != nil {
 			return fmt.Errorf("generate self cert error: %s", err)
 		}
+	case "remote":
+		if cert.CertFile == "" || cert.KeyFile == "" {
+			return fmt.Errorf("cert file path or key file path not exist")
+		}
+		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
+			return nil
+		}
+		if cert.TlsCert == "" || cert.TlsKey == "" {
+			return fmt.Errorf("tls cert or tls key not exist")
+		}
+		if err := os.WriteFile(cert.CertFile, []byte(cert.TlsCert), 0644); err != nil {
+			return fmt.Errorf("write remote cert error: %s", err)
+		}
+		if err := os.WriteFile(cert.KeyFile, []byte(cert.TlsKey), 0600); err != nil {
+			return fmt.Errorf("write remote key error: %s", err)
+		}
+
 	default:
 		return fmt.Errorf("unsupported certmode: %s", cert.CertMode)
 	}
