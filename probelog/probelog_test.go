@@ -566,11 +566,15 @@ func TestAuthCorrelation(t *testing.T) {
 		t.Fatalf("flow-first: %+v", e)
 	}
 
-	// final 之后迟到的日志 → correction（同 flow_id，revision+1，完整行）
+	// final 之后迟到的日志 → 候选窗口关闭后 correction（同 flow_id，revision+1，完整行）
 	h = newHarness(t, ObsInbound, 1)
 	feedSegments(h, 8002, [][2]int{{0, len(ch)}}, ch)
 	h.sweep(5 * time.Second)
 	h.access(cIP, 8002, xlog.AccessAccepted, 6*time.Second)
+	if n := len(h.kind(KindTCPFlow)); n != 1 {
+		t.Fatalf("decided before candidate window closed: %d records", n)
+	}
+	h.sweep(10 * time.Second)
 	recs := h.kind(KindTCPFlow)
 	if len(recs) != 2 || recs[0].RecordType != RecordFinal || recs[1].RecordType != RecordCorrection ||
 		recs[0].FlowID != recs[1].FlowID || recs[1].Revision != recs[0].Revision+1 || recs[1].Auth != AuthAccepted ||

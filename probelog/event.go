@@ -2,8 +2,9 @@ package probelog
 
 import "time"
 
-// SchemaVersion 是事件模型版本。v1 为最初版本（无 flow_id），v2 起有连接实例、修订与质量字段。
-const SchemaVersion = 2
+// SchemaVersion 是事件模型版本。v1 为最初版本（无 flow_id），v2 起有连接实例、修订与质量字段；
+// v3 起前缀采集与 TLS 判别分开（prefix_stop）、handshake 区分已核对与推定（hs_flags）、tls_state 增加 conflict。
+const SchemaVersion = 3
 
 // 事件类型
 const (
@@ -60,8 +61,24 @@ const (
 const (
 	HandshakeSynOnly     = "syn_only"    // 只看到客户端 SYN
 	HandshakeSynAck      = "synack"      // 看到服务端 SYN-ACK（需要双向观测）
-	HandshakeEstablished = "established" // 客户端 ACK 了服务端 ISN，或已有客户端数据
+	HandshakeEstablished = "established" // 核对过的证据：客户端段的 ACK 可接受（= 节点 ISN+1，full 模式下不超过节点已发送范围）
+	HandshakeInferred    = "inferred"    // 推定：SYN 之后有带 ACK 标志的客户端数据/FIN，但 ACK 无法核对（没看到 SYN-ACK，或 control 模式下可能确认了看不到的节点数据）
 	HandshakeUnknown     = "unknown"     // 只看入站且没有足够证据
+)
+
+// hs_flags：握手相关的异常证据，逗号分隔
+const (
+	HSFlagBadAck = "bad_ack" // 看到 SYN-ACK 后，客户端段的 ACK 不可接受（早于节点 ISN+1，或 full 模式下超出节点已发送范围）
+	HSFlagNoAck  = "no_ack"  // SYN 之后的客户端数据/FIN 没有 ACK 标志
+)
+
+// prefix_stop：客户端前缀采集在什么条件下结束
+const (
+	PrefixStopBytes    = "bytes"    // 达到字节预算：前缀已满 4096 字节且 TLS 判别有结论，或重组缓存满 16 KiB
+	PrefixStopWindow   = "window"   // 首个数据段之后 2 秒（按包时间）
+	PrefixStopFlowEnd  = "flow_end" // 窗口内连接就结束了（final）
+	PrefixStopSnapshot = "snapshot" // 窗口内到了 60 秒快照
+	PrefixStopOverflow = "overflow" // 乱序暂存达到上限
 )
 
 // Event 对应 ClickHouse 表的一行，json tag 即列名
@@ -115,9 +132,10 @@ type Event struct {
 	// 重组后的客户端字节流前缀
 	PrefixLen  uint32 `json:"prefix_len,omitempty"`
 	PrefixHash string `json:"prefix_hash,omitempty"` // 前 prefix_len 字节的 sha256 前 8 字节
-	ReasmFlags string `json:"reasm_flags,omitempty"` // gap / conflict / overflow / truncated / retrans
+	ReasmFlags string `json:"reasm_flags,omitempty"` // gap / conflict / overflow / truncated / retrans，只描述 prefix_stop 之前
+	PrefixStop string `json:"prefix_stop,omitempty"` // 前缀采集结束条件
 
-	// TLS ClientHello（只有 tls_state=complete 时下列指纹才填写）
+	// TLS ClientHello（只有 tls_state=complete 时下列指纹才填写；conflict 不填写）
 	TLSState string `json:"tls_state,omitempty"`
 	TLSVer   string `json:"tls_ver,omitempty"`
 	TLSSNI   string `json:"tls_sni,omitempty"`
@@ -138,6 +156,7 @@ type Event struct {
 	FlowEnd   string `json:"flow_end,omitempty"` // 记录生成原因，见 README
 	CloseBy   string `json:"close_by,omitempty"`
 	Handshake string `json:"handshake,omitempty"`
+	HSFlags   string `json:"hs_flags,omitempty"`
 
 	// 节点→客户端方向（obs_mode=control 时只有控制包，full 时才有数据统计）
 	OutPkts       uint32 `json:"out_pkts,omitempty"`

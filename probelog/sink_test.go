@@ -126,7 +126,7 @@ func TestSinkSchemaCheckMissing(t *testing.T) {
 	}
 }
 
-// 迁移脚本必须补齐 v1 表没有的所有列
+// 迁移脚本（按顺序执行）必须补齐 v1 表没有的所有列
 func TestMigrationCoversNewColumns(t *testing.T) {
 	v1 := strings.Fields(`ts node kind proto src_ip src_port dst_ip dst_port src_geo port_state node_tag node_type
 		ttl ip_id ip_df tcp_flags tcp_win tcp_opts mss ts_val ts_ecr syn_retrans payload_len payload_head payload_hash
@@ -136,9 +136,13 @@ func TestMigrationCoversNewColumns(t *testing.T) {
 	for _, c := range v1 {
 		old[c] = true
 	}
-	mig, err := os.ReadFile("migrations/002_v2.sql")
-	if err != nil {
-		t.Fatal(err)
+	var mig []byte
+	for _, f := range []string{"migrations/002_v2.sql", "migrations/003_v3.sql"} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mig = append(mig, b...)
 	}
 	for _, c := range eventColumns() {
 		if !old[c] && !strings.Contains(string(mig), "ADD COLUMN IF NOT EXISTS "+c+" ") {

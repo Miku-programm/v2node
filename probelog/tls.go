@@ -39,6 +39,7 @@ const (
 	tlsMalformed  = "malformed"        // 像 TLS ClientHello 但结构不合法
 	tlsComplete   = "complete"         // 完整解析，指纹可用
 	tlsIncomplete = "incomplete"       // 结束时仍是 need_more（缺口、截断、超时或连接结束）
+	tlsConflict   = "conflict"         // 语法可解析，但 ClientHello 范围内有内容不一致的重叠段，不输出指纹
 )
 
 const (
@@ -49,38 +50,47 @@ const (
 // classifyClientHello 判断字节流前缀是否是 TLS ClientHello，跨多个 handshake record 时先拼接再解析。
 // 只有返回 tlsComplete 时 ClientHello 可用。
 func classifyClientHello(b []byte) (string, *clientHello) {
+	state, ch, _ := classifyClientHelloN(b)
+	return state, ch
+}
+
+// classifyClientHelloN 同 classifyClientHello，另外返回 ClientHello 在字节流中占用的长度
+// （到最后一个包含 ClientHello 字节的 record 末尾），用于判断重组质量问题是否落在 ClientHello 范围内。
+func classifyClientHelloN(b []byte) (string, *clientHello, int) {
 	if len(b) == 0 {
-		return tlsNeedMore, nil
+		return tlsNeedMore, nil, 0
 	}
 	if b[0] != 0x16 || (len(b) >= 2 && b[1] != 3) {
-		return tlsNotCH, nil
+		return tlsNotCH, nil, 0
 	}
 	var hs []byte
 	hsLen := -1
+	used := 0
 	for {
 		if len(b) < 5 {
-			return tlsNeedMore, nil
+			return tlsNeedMore, nil, 0
 		}
 		if b[0] != 0x16 || b[1] != 3 {
 			// ClientHello 还没收齐就出现了别的记录
-			return tlsMalformed, nil
+			return tlsMalformed, nil, 0
 		}
 		l := int(binary.BigEndian.Uint16(b[3:5]))
 		if l == 0 || l > maxTLSRecordLen {
-			return tlsMalformed, nil
+			return tlsMalformed, nil, 0
 		}
 		if len(b) < 5+l {
-			return tlsNeedMore, nil
+			return tlsNeedMore, nil, 0
 		}
 		hs = append(hs, b[5:5+l]...)
 		b = b[5+l:]
+		used += 5 + l
 		if hsLen < 0 && len(hs) >= 4 {
 			if hs[0] != 1 {
-				return tlsNotCH, nil
+				return tlsNotCH, nil, 0
 			}
 			hsLen = int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
 			if hsLen > maxClientHelloBytes {
-				return tlsMalformed, nil
+				return tlsMalformed, nil, 0
 			}
 		}
 		if hsLen >= 0 && len(hs) >= hsLen+4 {
@@ -89,9 +99,9 @@ func classifyClientHello(b []byte) (string, *clientHello) {
 	}
 	ch, err := parseHandshake(hs[:hsLen+4])
 	if err != nil {
-		return tlsMalformed, nil
+		return tlsMalformed, nil, used
 	}
-	return tlsComplete, ch
+	return tlsComplete, ch, used
 }
 
 // parseClientHello 解析完整的 ClientHello（测试与工具使用）
@@ -103,7 +113,24 @@ func parseClientHello(b []byte) (*clientHello, error) {
 	return ch, nil
 }
 
-// parseHandshake 解析一条完整的 ClientHello handshake 消息（含 4 字节头）
+var errMalformedHello = errors.New("malformed client hello")
+
+// u16List 把 uint16 向量拆成元素；长度必须是偶数，且至少 min 个元素
+func u16List(v []byte, min int) ([]uint16, error) {
+	if len(v)%2 != 0 || len(v)/2 < min {
+		return nil, errMalformedHello
+	}
+	out := make([]uint16, 0, len(v)/2)
+	for i := 0; i < len(v); i += 2 {
+		out = append(out, binary.BigEndian.Uint16(v[i:]))
+	}
+	return out, nil
+}
+
+// parseHandshake 解析一条完整的 ClientHello handshake 消息（含 4 字节头）。
+//
+// 消息已完整收到，所以任何一层向量的声明长度与实际内容不符（越界、剩余尾部、元素大小不对）都是结构畸形，
+// 不是“还要等数据”。未知扩展按声明长度整体跳过。
 func parseHandshake(hs []byte) (*clientHello, error) {
 	hsLen := int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
 	ch := &clientHello{length: hsLen + 4}
@@ -113,60 +140,84 @@ func parseHandshake(hs []byte) (*clientHello, error) {
 	sid := r.vec8()
 	ch.sidLen = len(sid)
 	cs := r.vec16()
-	for i := 0; i+1 < len(cs); i += 2 {
-		ch.ciphers = append(ch.ciphers, binary.BigEndian.Uint16(cs[i:]))
+	comp := r.vec8()
+	if r.err != nil || len(sid) > 32 || len(comp) == 0 {
+		return nil, errMalformedHello
 	}
-	r.vec8() // compression
-	if r.err != nil {
-		return nil, r.err
+	var err error
+	if ch.ciphers, err = u16List(cs, 1); err != nil {
+		return nil, err
 	}
 	if r.left() == 0 {
 		return ch, nil
 	}
 	exts := reader{b: r.vec16()}
-	for exts.left() >= 4 && exts.err == nil {
+	if r.err != nil || r.left() != 0 {
+		return nil, errMalformedHello
+	}
+	for exts.left() > 0 {
 		typ := exts.u16()
 		data := reader{b: exts.vec16()}
+		if exts.err != nil {
+			return nil, errMalformedHello
+		}
 		ch.exts = append(ch.exts, typ)
-		switch typ {
-		case 0x0000: // server_name
-			list := reader{b: data.vec16()}
-			for list.left() > 3 {
-				nt := list.u8()
-				name := list.vec16()
-				if nt == 0 {
-					ch.sni = string(name)
-					break
-				}
-			}
-		case 0x0010: // ALPN
-			list := reader{b: data.vec16()}
-			for list.left() > 0 && list.err == nil {
-				ch.alpn = append(ch.alpn, string(list.vec8()))
-			}
-		case 0x000a: // supported_groups
-			g := data.vec16()
-			for i := 0; i+1 < len(g); i += 2 {
-				ch.groups = append(ch.groups, binary.BigEndian.Uint16(g[i:]))
-			}
-		case 0x000b: // ec_point_formats
-			ch.pointFmts = append(ch.pointFmts, data.vec8()...)
-		case 0x000d: // signature_algorithms
-			s := data.vec16()
-			for i := 0; i+1 < len(s); i += 2 {
-				ch.sigAlgs = append(ch.sigAlgs, binary.BigEndian.Uint16(s[i:]))
-			}
-		case 0x002b: // supported_versions
-			v := data.vec8()
-			for i := 0; i+1 < len(v); i += 2 {
-				ch.supVers = append(ch.supVers, binary.BigEndian.Uint16(v[i:]))
-			}
+		if err := ch.parseExtension(typ, &data); err != nil {
+			return nil, err
 		}
 	}
-	if exts.err != nil || exts.left() != 0 || r.left() != 0 {
-		return nil, errors.New("malformed client hello extensions")
-	}
 	return ch, nil
+}
+
+// parseExtension 解析已识别的扩展；要求扩展内容被完整、恰好消费
+func (ch *clientHello) parseExtension(typ uint16, data *reader) error {
+	var err error
+	switch typ {
+	case 0x0000: // server_name
+		list := reader{b: data.vec16()}
+		if len(list.b) == 0 {
+			return errMalformedHello
+		}
+		for list.left() > 0 {
+			nt := list.u8()
+			name := list.vec16()
+			if list.err != nil {
+				return errMalformedHello
+			}
+			if nt == 0 && ch.sni == "" {
+				ch.sni = string(name)
+			}
+		}
+	case 0x0010: // ALPN
+		list := reader{b: data.vec16()}
+		if len(list.b) == 0 {
+			return errMalformedHello
+		}
+		for list.left() > 0 {
+			name := list.vec8()
+			if list.err != nil || len(name) == 0 {
+				return errMalformedHello
+			}
+			ch.alpn = append(ch.alpn, string(name))
+		}
+	case 0x000a: // supported_groups
+		ch.groups, err = u16List(data.vec16(), 1)
+	case 0x000b: // ec_point_formats
+		ch.pointFmts = append(ch.pointFmts, data.vec8()...)
+		if len(ch.pointFmts) == 0 {
+			err = errMalformedHello
+		}
+	case 0x000d: // signature_algorithms
+		ch.sigAlgs, err = u16List(data.vec16(), 1)
+	case 0x002b: // supported_versions
+		ch.supVers, err = u16List(data.vec8(), 1)
+	default:
+		data.skip(data.left())
+	}
+	if err != nil || data.err != nil || data.left() != 0 {
+		return errMalformedHello
+	}
+	return nil
 }
 
 func (ch *clientHello) version() uint16 {

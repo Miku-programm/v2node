@@ -47,8 +47,9 @@ type flow struct {
 	key  flowKey
 	base Event // 不变字段：身份、指纹、首段特征、TLS；每次输出都复制一份
 
-	first time.Time
-	last  time.Time
+	first   time.Time
+	last    time.Time // 最后一个入站包（flow_ms 的终点）
+	lastAny time.Time // 任一方向最后一个可观察的包（回收计时）
 
 	hasSyn   bool
 	synAt    time.Time
@@ -60,18 +61,22 @@ type flow struct {
 	pkts         uint32
 	bytes        uint64
 
-	cli          *reassembler
-	cliFlags     string
-	clientFrozen bool
+	cli        *reassembler
+	cliFlags   string
+	prefixDone bool // 客户端前缀采集已结束（与 TLS 判别是否结束无关）
 
-	hasSynAck   bool
-	srvISN      uint32
-	established bool
-	srv         *reassembler
-	respAt      time.Time
-	respFrozen  bool
-	outPkts     uint32
-	outBytes    uint64
+	hasSynAck  bool
+	srvISN     uint32
+	srvSent    int64 // 观察到的节点已发送序列号跨度（数据 + FIN），相对 ISN+1
+	hsVerified bool  // 客户端 ACK 了节点 ISN（可接受的 ACK）
+	hsInferred bool  // 带 ACK 的客户端数据/FIN，但无法核对 ACK（没看到 SYN-ACK，或可能确认了看不到的节点数据）
+	hsBadAck   bool  // 客户端段的 ACK 不可接受
+	hsNoAck    bool  // 客户端数据/FIN 没有 ACK 标志
+	srv        *reassembler
+	respAt     time.Time
+	respFrozen bool
+	outPkts    uint32
+	outBytes   uint64
 
 	clientFin, clientRst, serverFin, serverRst bool
 	closeDeadline                              time.Time // 观察到关闭后何时输出 final
@@ -87,9 +92,19 @@ type flow struct {
 	suppressed   bool // 已认证流被采样丢弃（对整条连接稳定）
 }
 
+// access 记录的关联状态
+const (
+	logUndecided = iota // 候选窗口还没关闭
+	logMatched          // 已归属到唯一候选
+	logAmbiguous        // 有多个候选，没有传播认证结果
+)
+
+// pendingLog 是一条 access 记录。决定之后仍保留 lateWindow，用于复核之后才处理到的候选连接。
 type pendingLog struct {
 	at     time.Time
 	status string
+	state  int
+	target *flow
 }
 
 // flowTable 跟踪到本机监听端口的连接实例，在快照、结束和迟到修订时输出记录
@@ -242,17 +257,18 @@ func inboundKey(p *packet) flowKey {
 }
 
 // newFlow 建立新连接实例并登记到关联索引。调用方持有锁。
-func (t *flowTable) newFlow(kind string, key flowKey, state string, np NodePort, now time.Time) (*flow, *Event) {
+func (t *flowTable) newFlow(kind string, key flowKey, state string, np NodePort, now time.Time) (*flow, []*Event) {
 	if len(t.flows) >= maxFlows || t.tracked >= maxTracked {
 		t.r.stats.flowTableFull.Add(1)
 		return nil, nil
 	}
 	f := &flow{
-		id:    newFlowID(),
-		key:   key,
-		base:  baseEvent(kind, key, state, np, now),
-		first: now,
-		last:  now,
+		id:      newFlowID(),
+		key:     key,
+		base:    baseEvent(kind, key, state, np, now),
+		first:   now,
+		last:    now,
+		lastAny: now,
 	}
 	if state == PortNode {
 		f.auth, f.assoc = AuthUnknown, AssocUnmatched
@@ -263,25 +279,29 @@ func (t *flowTable) newFlow(kind string, key flowKey, state string, np NodePort,
 	sk := srcKey{udp: key.proto == ipProtoUDP, client: key.client}
 	t.bySrc[sk] = append(t.bySrc[sk], f)
 	t.tracked++
-	// 日志比抓包先到：把等待中的 access 记录应用到新连接
-	var corr *Event
-	if logs := t.pending[sk]; len(logs) > 0 && state == PortNode {
-		kept := logs[:0]
-		for _, l := range logs {
-			if !l.at.Before(now.Add(-closeGrace)) {
-				corr = t.applyAuth(f, l.status)
-			} else {
-				kept = append(kept, l)
+	// 已经做出决定的 access 记录：如果新连接也落在它的候选窗口里，原来的归属不再唯一，改为 ambiguous。
+	// 还没决定的记录在候选窗口关闭后统一处理（resolveLogs），不在这里抢先绑定第一个出现的连接。
+	var out []*Event
+	if state == PortNode {
+		logs := t.pending[sk]
+		for i := range logs {
+			l := &logs[i]
+			if l.state == logUndecided || !t.isCandidate(f, l.at) {
+				continue
+			}
+			if l.state == logMatched && l.target != f {
+				t.r.stats.assocAmbiguous.Add(1)
+				if e := t.setAuth(l.target, AuthUnknown, AssocAmbiguous); e != nil {
+					out = append(out, e)
+				}
+				l.state, l.target = logAmbiguous, nil
+			}
+			if l.state == logAmbiguous && f.assoc != AssocMatched {
+				t.setAuth(f, f.auth, AssocAmbiguous)
 			}
 		}
-		t.pendingN -= len(logs) - len(kept)
-		if len(kept) == 0 {
-			delete(t.pending, sk)
-		} else {
-			t.pending[sk] = kept
-		}
 	}
-	return f, corr
+	return f, out
 }
 
 func (t *flowTable) handleTCPIn(p *packet, now time.Time) []*Event {
@@ -304,7 +324,7 @@ func (t *flowTable) handleTCPIn(p *packet, now time.Time) []*Event {
 		case f.hasSyn && p.seq == f.synSeq:
 			// 同一 ISN：SYN 重传
 			f.synCount++
-			f.last = now
+			f.last, f.lastAny = now, now
 			return nil
 		default:
 			// 同一五元组的新连接（新 ISN，或旧连接是中途接上的）：旧连接结束，开始新实例
@@ -318,14 +338,12 @@ func (t *flowTable) handleTCPIn(p *packet, now time.Time) []*Event {
 			// 不认识的连接上的 FIN/RST（多半在记录器启动前建立），忽略
 			return out
 		}
-		var corr *Event
+		var corr []*Event
 		f, corr = t.newFlow(KindTCPFlow, key, state, np, now)
 		if f == nil {
 			return out
 		}
-		if corr != nil {
-			out = append(out, corr)
-		}
+		out = append(out, corr...)
 		if isSyn {
 			f.hasSyn = true
 			f.synAt = now
@@ -339,17 +357,13 @@ func (t *flowTable) handleTCPIn(p *packet, now time.Time) []*Event {
 			return out
 		}
 	}
-	f.last = now
-
-	if f.hasSynAck && p.flags&tcpACK != 0 && p.ack == f.srvISN+1 {
-		f.established = true
+	f.last, f.lastAny = now, now
+	if p.flags&tcpRST == 0 {
+		t.noteClientAck(f, p)
 	}
 	if n := len(p.payload); n > 0 {
 		f.pkts++
 		f.bytes += uint64(p.payloadWire)
-		if f.hasSyn {
-			f.established = true
-		}
 		if !f.firstSegDone {
 			f.firstSegDone = true
 			f.dataAt = now
@@ -358,10 +372,13 @@ func (t *flowTable) handleTCPIn(p *packet, now time.Time) []*Event {
 				ms := int32(now.Sub(f.synAt).Milliseconds())
 				f.base.FirstDataMs = &ms
 			}
+		} else if !f.prefixDone && now.Sub(f.dataAt) > firstFlightWait {
+			// 采集窗口按包时间判断，不依赖清理协程何时运行
+			t.finishPrefix(f, PrefixStopWindow)
 		}
-		if f.cli != nil && !f.clientFrozen {
+		if f.cli != nil && !f.prefixDone {
 			f.cli.add(p.seq, p.payload, p.truncated)
-			t.checkClientPrefix(f, false)
+			t.checkClientPrefix(f)
 		}
 	}
 	if p.flags&tcpRST != 0 {
@@ -369,12 +386,46 @@ func (t *flowTable) handleTCPIn(p *packet, now time.Time) []*Event {
 		t.markClosing(f, now)
 	} else if p.flags&tcpFIN != 0 {
 		f.clientFin = true
-		if f.hasSyn {
-			f.established = true
-		}
 		t.markClosing(f, now)
 	}
 	return out
+}
+
+// noteClientAck 根据客户端数据/FIN 段的 ACK 记录握手证据。
+//
+// 节点在 SYN-RECEIVED 状态只接受 ACK = 节点 ISN+1（RFC 9293 §3.10.7.4）；纯 ACK 被 BPF 排除，
+// 所以看到的第一个客户端段可能已经确认了节点之后发出的数据。能核对时才算 verified，
+// 不能核对时只给推定，确定不可接受的 ACK 不算握手证据。
+func (t *flowTable) noteClientAck(f *flow, p *packet) {
+	if !f.hasSyn || p.flags&tcpSYN != 0 {
+		return
+	}
+	if p.flags&tcpACK == 0 {
+		f.hsNoAck = true
+		return
+	}
+	if f.hsVerified {
+		return
+	}
+	if !f.hasSynAck {
+		f.hsInferred = true
+		return
+	}
+	d := int64(int32(p.ack - (f.srvISN + 1)))
+	switch {
+	case d == 0:
+		f.hsVerified = true
+	case d < 0:
+		f.hsBadAck = true
+	case t.obsMode == ObsFull && d <= f.srvSent:
+		f.hsVerified = true
+	case t.obsMode == ObsFull:
+		// full 模式能看到节点数据，ACK 超出了节点已发送的范围
+		f.hsBadAck = true
+	default:
+		// control 模式看不到节点数据，ACK 可能确认了这些数据
+		f.hsInferred = true
+	}
 }
 
 // handleTCPOut 处理节点发出的包（control / full 模式）
@@ -390,6 +441,7 @@ func (t *flowTable) handleTCPOut(p *packet, now time.Time) {
 	if f == nil {
 		return
 	}
+	f.lastAny = now
 	if p.flags&tcpSYN != 0 && p.flags&tcpACK != 0 {
 		if !f.hasSynAck {
 			f.hasSynAck = true
@@ -399,6 +451,13 @@ func (t *flowTable) handleTCPOut(p *packet, now time.Time) {
 			}
 		}
 		return
+	}
+	if f.hasSynAck && p.flags&tcpRST == 0 {
+		end := int64(int32(p.seq-(f.srvISN+1))) + int64(p.payloadWire)
+		if p.flags&tcpFIN != 0 {
+			end++
+		}
+		f.srvSent = max(f.srvSent, end)
 	}
 	if n := len(p.payload); n > 0 && t.obsMode == ObsFull {
 		f.outPkts++
@@ -439,25 +498,49 @@ func (t *flowTable) markClosing(f *flow, now time.Time) {
 	}
 }
 
-// checkClientPrefix 判断 ClientHello 是否已有结论；force 表示不再等待（超时、结束、到达上限）
-func (t *flowTable) checkClientPrefix(f *flow, force bool) {
-	if f.clientFrozen || f.cli == nil {
+// checkClientPrefix 在收到客户端数据后判断前缀采集能否按字节预算提前结束。
+//
+// 前缀采集与 TLS 判别分开：首字节就能判断“不是 ClientHello”时，前缀仍按同样的预算继续采集，
+// 否则同一字节流会因为 TCP 分段不同而得到不同长度的前缀。提前结束只看字节数，与分段无关。
+func (t *flowTable) checkClientPrefix(f *flow) {
+	if f.prefixDone || f.cli == nil {
 		return
 	}
-	prefix := f.cli.prefix()
-	state, ch := classifyClientHello(prefix)
-	if state == tlsNeedMore {
-		limited := len(prefix) >= clientPrefixLimit || f.cli.flags[reasmOverflow]
-		if !force && !limited {
-			return
+	n := len(f.cli.prefix())
+	switch {
+	case f.cli.flags[reasmOverflow]:
+		t.finishPrefix(f, PrefixStopOverflow)
+	case n >= clientPrefixLimit:
+		t.finishPrefix(f, PrefixStopBytes)
+	case n >= prefixHashMax:
+		if state, _ := classifyClientHello(f.cli.prefix()); state != tlsNeedMore {
+			t.finishPrefix(f, PrefixStopBytes)
 		}
+	}
+}
+
+// finishPrefix 结束客户端前缀采集，给出 TLS 结论与前缀哈希，并释放重组缓存。
+// 之后到达的客户端字节（包括其中的重叠冲突）不再检查，reasm_flags 只描述 prefix_stop 之前的观察。
+func (t *flowTable) finishPrefix(f *flow, reason string) {
+	if f.prefixDone || f.cli == nil {
+		return
+	}
+	f.prefixDone = true
+	prefix := f.cli.prefix()
+	state, ch, used := classifyClientHelloN(prefix)
+	switch state {
+	case tlsNeedMore:
 		if len(prefix) == 0 && !f.cli.hasGap() && !f.cli.flags[reasmTruncated] {
 			state = ""
 		} else {
 			state = tlsIncomplete
 		}
+	case tlsComplete:
+		if f.cli.conflictBefore(used) {
+			// ClientHello 范围内有内容不一致的重叠段：语法可以解析，但不能当作可比较的指纹
+			state = tlsConflict
+		}
 	}
-	f.clientFrozen = true
 	f.base.TLSState = state
 	if state == tlsComplete {
 		fillTLS(&f.base, ch)
@@ -467,11 +550,16 @@ func (t *flowTable) checkClientPrefix(f *flow, force bool) {
 		t.r.stats.tlsIncomplete.Add(1)
 	case tlsMalformed:
 		t.r.stats.tlsMalformed.Add(1)
+	case tlsConflict:
+		t.r.stats.tlsConflict.Add(1)
 	}
 	n := min(len(prefix), prefixHashMax)
 	f.base.PrefixLen = uint32(n)
 	f.base.PrefixHash = prefixHash(prefix[:n])
 	f.cliFlags = f.cli.flagString()
+	if n > 0 || f.cliFlags != "" {
+		f.base.PrefixStop = reason
+	}
 	if f.cli.flags[reasmConflict] {
 		t.r.stats.reasmConflict.Add(1)
 	}
@@ -481,7 +569,7 @@ func (t *flowTable) checkClientPrefix(f *flow, force bool) {
 	if f.cli.flags[reasmTruncated] {
 		t.r.stats.capTruncated.Add(1)
 	}
-	f.cli = nil // 结论已定，释放缓存
+	f.cli = nil
 }
 
 func (t *flowTable) freezeResponse(f *flow) {
@@ -502,21 +590,19 @@ func (t *flowTable) handleUDP(p *packet, now time.Time) []*Event {
 	var out []*Event
 	f := t.flows[key]
 	if f == nil {
-		var corr *Event
+		var corr []*Event
 		f, corr = t.newFlow(KindUDPFlow, key, state, np, now)
 		if f == nil {
 			return nil
 		}
-		if corr != nil {
-			out = append(out, corr)
-		}
+		out = append(out, corr...)
 		fillIPFingerprint(&f.base, p)
 		fillFirstSegment(&f.base, p, t.r.cfg.PayloadHeadBytes)
 		f.base.QUICVer = quicVersion(p.payload)
 		f.firstSegDone = true
 		f.dataAt = now
 	}
-	f.last = now
+	f.last, f.lastAny = now, now
 	f.pkts++
 	f.bytes += uint64(p.payloadWire)
 	return out
@@ -527,8 +613,10 @@ func (t *flowTable) handshakeState(f *flow) string {
 	switch {
 	case f.key.proto != ipProtoTCP:
 		return ""
-	case f.established:
+	case f.hsVerified:
 		return HandshakeEstablished
+	case f.hsInferred:
+		return HandshakeInferred
 	case f.hasSynAck:
 		return HandshakeSynAck
 	case f.hasSyn && t.obsMode != ObsInbound:
@@ -537,6 +625,18 @@ func (t *flowTable) handshakeState(f *flow) string {
 		return HandshakeSynOnly
 	}
 	return HandshakeUnknown
+}
+
+func hsFlags(f *flow) string {
+	switch {
+	case f.hsBadAck && f.hsNoAck:
+		return HSFlagBadAck + "," + HSFlagNoAck
+	case f.hsBadAck:
+		return HSFlagBadAck
+	case f.hsNoAck:
+		return HSFlagNoAck
+	}
+	return ""
 }
 
 func closeBy(f *flow) string {
@@ -574,6 +674,7 @@ func (t *flowTable) buildRecord(f *flow, recordType, end string) *Event {
 		e.SynRetrans = f.synCount
 		e.CloseBy = closeBy(f)
 		e.Handshake = t.handshakeState(f)
+		e.HSFlags = hsFlags(f)
 		e.ReasmFlags = f.cliFlags
 		if t.obsMode == ObsFull {
 			e.OutPkts = f.outPkts
@@ -607,7 +708,7 @@ func (t *flowTable) keep(f *flow) bool {
 
 func (t *flowTable) appendSnapshot(out []*Event, f *flow) []*Event {
 	f.snapshotDone = true
-	t.checkClientPrefix(f, true)
+	t.finishPrefix(f, PrefixStopSnapshot)
 	t.freezeResponse(f)
 	if !t.keep(f) {
 		return out
@@ -621,7 +722,7 @@ func (t *flowTable) appendFinal(out []*Event, f *flow, end string, now time.Time
 	if f.finalized {
 		return out
 	}
-	t.checkClientPrefix(f, true)
+	t.finishPrefix(f, PrefixStopFlowEnd)
 	t.freezeResponse(f)
 	f.finalized = true
 	f.endAt = now
@@ -635,7 +736,30 @@ func (t *flowTable) appendFinal(out []*Event, f *flow, end string, now time.Time
 	return append(out, t.buildRecord(f, RecordFinal, end))
 }
 
-// onAccess 由 xray access 记录调用。只有唯一候选时才传播认证结果；多个候选标记 ambiguous。
+// isCandidate 判断连接是否可能是 at 时刻那条 access 记录的来源。
+// xray access 记录只有来源地址，没有入站目标，只能按来源 ip:port 与时间窗筛选。
+func (t *flowTable) isCandidate(f *flow, at time.Time) bool {
+	if f.base.PortState != PortNode || f.first.After(at.Add(closeGrace)) {
+		return false
+	}
+	// 日志时间晚于 final：只接受在 closeGrace 内迟到的（日志处理延迟）
+	return !f.finalized || at.Sub(f.endAt) <= closeGrace
+}
+
+func (t *flowTable) candidates(sk srcKey, at time.Time) []*flow {
+	var cands []*flow
+	for _, f := range t.bySrc[sk] {
+		if t.isCandidate(f, at) {
+			cands = append(cands, f)
+		}
+	}
+	return cands
+}
+
+// onAccess 由 xray access 记录调用。
+//
+// 已有多个候选时立即标记 ambiguous（之后再出现候选也不会变成唯一）。否则等候选窗口关闭
+// （日志时间 + assocDecideAfter）后由 resolveLogs 决定，避免按处理顺序把结果绑定到先出现的连接。
 func (t *flowTable) onAccess(udp bool, ip string, port uint16, status string, at time.Time) []*Event {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
@@ -644,59 +768,108 @@ func (t *flowTable) onAccess(udp bool, ip string, port uint16, status string, at
 	sk := srcKey{udp: udp, client: netip.AddrPortFrom(addr.Unmap(), port)}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	var cands []*flow
-	for _, f := range t.bySrc[sk] {
-		if f.base.PortState != PortNode {
-			continue
-		}
-		if f.first.After(at.Add(closeGrace)) {
-			continue
-		}
-		if f.finalized && at.After(f.endAt) {
-			// 日志时间晚于 final：只接受在 closeGrace 内迟到的（日志处理延迟）
-			if at.Sub(f.endAt) > closeGrace {
-				continue
-			}
-		}
-		cands = append(cands, f)
-	}
-	switch len(cands) {
-	case 0:
-		if t.pendingN >= maxPendingLogs {
-			t.r.stats.pendingLogsDropped.Add(1)
-			return nil
-		}
-		t.pending[sk] = append(t.pending[sk], pendingLog{at: at, status: status})
-		t.pendingN++
-		return nil
-	case 1:
-		if e := t.applyAuth(cands[0], status); e != nil {
-			return []*Event{e}
-		}
+	if t.pendingN >= maxPendingLogs {
+		t.r.stats.pendingLogsDropped.Add(1)
 		return nil
 	}
-	t.r.stats.assocAmbiguous.Add(1)
-	for _, f := range cands {
-		if f.assoc != AssocMatched {
-			f.assoc = AssocAmbiguous
-		}
+	l := pendingLog{at: at, status: status}
+	var out []*Event
+	if cands := t.candidates(sk, at); len(cands) >= 2 {
+		l.state = logAmbiguous
+		out = t.markAmbiguous(cands)
 	}
-	return nil
+	t.pending[sk] = append(t.pending[sk], l)
+	t.pendingN++
+	return out
 }
 
-// applyAuth 把认证结果写到连接上；连接已输出 final 时生成 correction
-func (t *flowTable) applyAuth(f *flow, status string) *Event {
-	changed := f.assoc != AssocMatched
-	f.assoc = AssocMatched
-	if f.auth != AuthAccepted && f.auth != status {
-		f.auth = status
-		changed = true
+// markAmbiguous 把候选连接标记为 ambiguous；已被其他记录唯一匹配的连接保持不变
+func (t *flowTable) markAmbiguous(cands []*flow) []*Event {
+	t.r.stats.assocAmbiguous.Add(1)
+	var out []*Event
+	for _, f := range cands {
+		if f.assoc == AssocMatched {
+			continue
+		}
+		if e := t.setAuth(f, f.auth, AssocAmbiguous); e != nil {
+			out = append(out, e)
+		}
 	}
-	if !changed || !f.finalized || !f.emittedAny || f.suppressed {
+	return out
+}
+
+// setAuth 更新认证结论。已输出 final 的连接结论有变化时生成 correction（完整行，revision+1）；
+// 没有变化时不输出，重复的日志不会产生无意义的修订。
+func (t *flowTable) setAuth(f *flow, auth, assoc string) *Event {
+	if f.auth == auth && f.assoc == assoc {
+		return nil
+	}
+	f.auth, f.assoc = auth, assoc
+	if !f.finalized || !f.emittedAny || f.suppressed {
 		return nil
 	}
 	t.r.stats.lateCorrections.Add(1)
 	return t.buildRecord(f, RecordCorrection, "late_auth")
+}
+
+// resolveLogs 处理候选窗口已关闭的 access 记录，并清理过期记录。调用方持有锁。
+func (t *flowTable) resolveLogs(now time.Time) []*Event {
+	var out []*Event
+	for sk, logs := range t.pending {
+		kept := logs[:0]
+		for _, l := range logs {
+			age := now.Sub(l.at)
+			if l.state == logUndecided && age > assocDecideAfter {
+				cands := t.candidates(sk, l.at)
+				switch len(cands) {
+				case 0:
+					// 还没有候选：可能是抓包处理落后，继续等到 pendingLogTTL
+					if age > pendingLogTTL {
+						t.r.stats.pendingLogsExpired.Add(1)
+						t.pendingN--
+						continue
+					}
+				case 1:
+					f := cands[0]
+					auth := l.status
+					if f.auth == AuthAccepted {
+						auth = AuthAccepted
+					}
+					l.state, l.target = logMatched, f
+					if e := t.setAuth(f, auth, AssocMatched); e != nil {
+						out = append(out, e)
+					}
+				default:
+					l.state = logAmbiguous
+					out = append(out, t.markAmbiguous(cands)...)
+				}
+			}
+			if l.state != logUndecided && age > lateWindow {
+				t.pendingN--
+				continue
+			}
+			kept = append(kept, l)
+		}
+		if len(kept) == 0 {
+			delete(t.pending, sk)
+		} else {
+			t.pending[sk] = kept
+		}
+	}
+	return out
+}
+
+// awaitingLog 表示还有未决定的 access 记录可能属于这个连接
+func (t *flowTable) awaitingLog(f *flow) bool {
+	if f.base.PortState != PortNode {
+		return false
+	}
+	for _, l := range t.pending[srcKey{udp: f.key.proto == ipProtoUDP, client: f.key.client}] {
+		if l.state == logUndecided && t.isCandidate(f, l.at) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *flowTable) sweepLoop() {
@@ -719,23 +892,29 @@ func (t *flowTable) sweepLoop() {
 }
 
 func (t *flowTable) sweep(now time.Time) {
-	var out []*Event
 	t.mu.Lock()
+	// 先决定候选窗口已关闭的 access 记录，让同一轮输出的 final 带上结论
+	out := t.resolveLogs(now)
 	for k, f := range t.flows {
-		if !f.clientFrozen && !f.dataAt.IsZero() && now.Sub(f.dataAt) > firstFlightWait {
-			t.checkClientPrefix(f, true)
+		if !f.prefixDone && !f.dataAt.IsZero() && now.Sub(f.dataAt) > firstFlightWait {
+			t.finishPrefix(f, PrefixStopWindow)
 		}
 		if !f.respFrozen && !f.respAt.IsZero() && now.Sub(f.respAt) > firstFlightWait {
 			t.freezeResponse(f)
 		}
-		idle := now.Sub(f.last)
+		// 回收计时看任一方向最后一个可观察的包（full 模式的下行数据也算）
+		idle := now.Sub(f.lastAny)
 		var end string
 		switch {
 		case !f.closeDeadline.IsZero() && !now.Before(f.closeDeadline):
+			if t.awaitingLog(f) {
+				// 还有候选窗口未关闭的 access 记录：推迟到它决定（最多 assocDecideAfter）
+				continue
+			}
 			end = "closed"
 		case k.proto == ipProtoUDP && idle > udpIdleTimeout:
 			end = "idle_timeout"
-		case k.proto == ipProtoTCP && f.pkts == 0 && idle > tcpSynOnlyTimeout:
+		case k.proto == ipProtoTCP && f.pkts == 0 && f.outPkts == 0 && idle > tcpSynOnlyTimeout:
 			end = "no_data_timeout"
 		case k.proto == ipProtoTCP && idle > tcpIdleTimeout:
 			end = "idle_timeout"
@@ -765,22 +944,6 @@ func (t *flowTable) sweep(now time.Time) {
 			t.bySrc[sk] = kept
 		}
 	}
-	for sk, logs := range t.pending {
-		kept := logs[:0]
-		for _, l := range logs {
-			if now.Sub(l.at) > pendingLogTTL {
-				t.r.stats.pendingLogsExpired.Add(1)
-				t.pendingN--
-				continue
-			}
-			kept = append(kept, l)
-		}
-		if len(kept) == 0 {
-			delete(t.pending, sk)
-		} else {
-			t.pending[sk] = kept
-		}
-	}
 	t.mu.Unlock()
 	for _, e := range out {
 		t.r.emit(e)
@@ -788,9 +951,11 @@ func (t *flowTable) sweep(now time.Time) {
 }
 
 const (
-	lateWindow     = 30 * time.Second // final 之后还接受迟到关联的时间（用于判断端口复用的候选）
-	pendingLogTTL  = 10 * time.Second // 先于抓包到达的 access 记录最多等多久
-	maxPendingLogs = 10000
+	lateWindow    = 30 * time.Second // final 之后还接受迟到关联的时间（用于判断端口复用的候选）
+	pendingLogTTL = 10 * time.Second // access 记录最多等多久出现候选连接
+	// 候选窗口：日志时间 + closeGrace 之前出现的连接都算候选，再留 1 秒给抓包与日志处理的先后差
+	assocDecideAfter = closeGrace + time.Second
+	maxPendingLogs   = 10000
 )
 
 func itoa(v uint32) string {

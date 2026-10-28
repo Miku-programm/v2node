@@ -56,6 +56,7 @@ type recorderStats struct {
 	midstreamFlows     atomic.Uint64
 	tlsIncomplete      atomic.Uint64
 	tlsMalformed       atomic.Uint64
+	tlsConflict        atomic.Uint64
 	reasmConflict      atomic.Uint64
 	reasmOverflow      atomic.Uint64
 	capTruncated       atomic.Uint64
@@ -222,6 +223,7 @@ func (r *Recorder) statsLoop() {
 				"midstream_flows":      s.midstreamFlows.Load(),
 				"tls_incomplete":       s.tlsIncomplete.Load(),
 				"tls_malformed":        s.tlsMalformed.Load(),
+				"tls_conflict":         s.tlsConflict.Load(),
 				"reasm_conflict":       s.reasmConflict.Load(),
 				"reasm_overflow":       s.reasmOverflow.Load(),
 				"cap_truncated":        s.capTruncated.Load(),

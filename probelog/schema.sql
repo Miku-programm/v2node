@@ -1,6 +1,6 @@
--- v2node 探测日志 ClickHouse 表结构（新安装，schema_version = 2）
+-- v2node 探测日志 ClickHouse 表结构（新安装，schema_version = 3）
 -- 用法：clickhouse-client --multiquery < schema.sql
--- 已有 v1 表的升级请用 migrations/002_v2.sql（CREATE TABLE IF NOT EXISTS 不会升级已有表）
+-- 已有表的升级按顺序执行 migrations/002_v2.sql（v1 表）、003_v3.sql（CREATE TABLE IF NOT EXISTS 不会升级已有表）
 -- 字段含义见 README.md；查询示例见 queries.sql
 
 CREATE DATABASE IF NOT EXISTS v2node;
@@ -8,7 +8,7 @@ CREATE DATABASE IF NOT EXISTS v2node;
 CREATE TABLE IF NOT EXISTS v2node.probe_events
 (
     ts  DateTime64(3, 'UTC'),                   -- 事件时间；流记录为连接首次观察时间
-    schema_version  UInt16 DEFAULT 0,           -- 0/1 = v1 旧行；2 = 当前模型
+    schema_version  UInt16 DEFAULT 0,           -- 0/1 = v1 旧行；2 = v2；3 = 当前模型（语义差异见 README）
     event_id  String,                           -- 记录唯一标识；流记录为 flow_id-revision
     emitted_at  DateTime64(3, 'UTC') DEFAULT ts, -- 记录生成时间
     node  LowCardinality(String),
@@ -51,9 +51,10 @@ CREATE TABLE IF NOT EXISTS v2node.probe_events
 
     prefix_len  UInt32,                         -- 重组后连续前缀长度（最多 4096）
     prefix_hash  String,                        -- sha256(前缀)[:8]，比较时连同 prefix_len
-    reasm_flags  LowCardinality(String),        -- gap / conflict / overflow / truncated / retrans
+    reasm_flags  LowCardinality(String),        -- gap / conflict / overflow / truncated / retrans；只描述 prefix_stop 之前
+    prefix_stop  LowCardinality(String),        -- v3：bytes / window / flow_end / snapshot / overflow
 
-    tls_state  LowCardinality(String),          -- need_more / not_client_hello / malformed / complete / incomplete；v1 为空
+    tls_state  LowCardinality(String),          -- not_client_hello / malformed / complete / incomplete / conflict（v3）；v1 为空
     tls_ver  LowCardinality(String),
     tls_sni  String,
     tls_alpn  String,
@@ -71,7 +72,8 @@ CREATE TABLE IF NOT EXISTS v2node.probe_events
     flow_bytes  UInt64,
     flow_end  LowCardinality(String),           -- v2：closed / no_data_timeout / idle_timeout / superseded / shutdown / open / late_auth
     close_by  LowCardinality(String),           -- client_fin / client_rst / server_fin / server_rst / both_fin / none
-    handshake  LowCardinality(String),          -- syn_only / synack / established / unknown
+    handshake  LowCardinality(String),          -- syn_only / synack / established / inferred（v3）/ unknown
+    hs_flags  LowCardinality(String),           -- v3：bad_ack / no_ack
 
     out_pkts  UInt32,
     out_bytes  UInt64,

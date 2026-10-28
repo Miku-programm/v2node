@@ -41,7 +41,7 @@
 - **记录类型 `record_type`**：同一 `flow_id` 可以有多条记录，按 `revision` 取最大的一条作为当前结论。
   - `snapshot`：连接持续 60 秒时的阶段快照（`flow_end=open`），只输出一次
   - `final`：连接结束或被回收时的汇总
-  - `correction`：`final` 之后迟到的 access 记录改变了认证结论时输出的完整行（`flow_end=late_auth`）
+  - `correction`：`final` 之后认证结论（`auth` 或 `auth_assoc`）发生变化时输出的完整行（`flow_end=late_auth`）：迟到的 access 记录、后来才发现的多候选歧义、或之后才处理到的候选让原来的唯一匹配不再唯一。结论没有变化时不输出；已输出的行不会被就地修改
 - **`event_id`** = `flow_id-revision`（其他事件为随机值），用于去重。
 - 没看到 SYN 的 TCP 连接（记录器启动前建立的，或空闲回收后又有数据）只跟踪、不上报，数量见 `stats.midstream_flows`。这会漏掉 SYN 丢失的连接。
 
@@ -50,8 +50,8 @@
 | 值 | 含义 |
 |---|---|
 | `closed` | 观察到了 FIN/RST，等待 2 秒（双向 FIN、RST，或 inbound 模式下的客户端 FIN）或 10 秒（只看到单向 FIN）后输出；具体方向见 `close_by` |
-| `no_data_timeout` | 只有 SYN、30 秒没有数据，采集器回收。不是观测到的服务端超时 |
-| `idle_timeout` | TCP 15 分钟（UDP 30 秒）没有可观察的包，采集器回收 |
+| `no_data_timeout` | 只有 SYN、30 秒没有任何方向的数据，采集器回收。不是观测到的服务端超时 |
+| `idle_timeout` | TCP 15 分钟（UDP 30 秒）任一方向都没有可观察的包，采集器回收。`full` 模式的下行数据会推迟回收；`inbound` 只看入站、`control` 只看节点控制包，单向长下载在这两种模式下仍可能被回收，这是观察能力的限制，不是网络事件 |
 | `superseded` | 同一五元组出现了新 ISN 的 SYN |
 | `shutdown` | 记录器停止（进程退出或热重载） |
 | `open` / `late_auth` | 快照 / 迟到修订 |
@@ -59,8 +59,14 @@
 ### `close_by`、`handshake`
 
 - `close_by`：`client_fin` / `client_rst` / `server_fin` / `server_rst` / `both_fin` / `none`。只表示采集器看到了哪个方向的 FIN/RST，不能单凭方向确定实际发送主体（例如链路上注入的 RST）。FIN 也可能只关闭一个方向。
-- `handshake`：`syn_only`（只看到客户端 SYN）、`synack`（看到节点 SYN-ACK，需要 control/full）、`established`（客户端 ACK 了节点 ISN，或客户端已发数据或 FIN）、`unknown`（inbound 模式下证据不足）。
-- `flow_ms` = 最后一个入站包时间 − 首个入站包时间；`flow_pkts` / `flow_bytes` 只统计入站数据包。都不包含回收前的等待时间。
+- `handshake`：按证据等级给出，**不是完整的 TCP 状态机**（纯 ACK 不抓，TFO 等情形没有单独建模）。
+  - `syn_only`：只看到客户端 SYN
+  - `synack`：看到节点 SYN-ACK（需要 control/full），但没有可接受的客户端 ACK
+  - `established`：核对过的证据——看到 SYN-ACK 之后，客户端数据/FIN 段的 ACK 可接受：等于节点 ISN+1，或在 `full` 模式下不超过节点已发送的序列号范围
+  - `inferred`：推定——SYN 之后有带 ACK 标志的客户端数据/FIN，但 ACK 无法核对（`inbound` 看不到 SYN-ACK；`control` 看不到节点数据，ACK 大于 ISN+1 时可能确认了这些数据）。数据到达不代表被节点协议栈接收
+  - `unknown`：inbound 模式下证据不足
+- `hs_flags`：`bad_ack`（看到 SYN-ACK 后客户端段的 ACK 不可接受：早于 ISN+1，或 `full` 模式下超出节点已发送范围）、`no_ack`（SYN 之后的客户端数据/FIN 没有 ACK 标志）。这两种段都不算握手证据；之后若出现可接受的 ACK 仍会得到 `established`，标记保留。
+- `flow_ms` = 最后一个入站包时间 − 首个入站包时间；`flow_pkts` / `flow_bytes` 只统计入站数据包。都不包含回收前的等待时间。回收计时（`idle_timeout`）另外按任一方向的最后一个可观察包计算，与 `flow_ms` 不同。
 
 ## 载荷字段
 
@@ -68,9 +74,10 @@
 |---|---|
 | `payload_len` / `payload_cap_len` / `payload_truncated` | 首个**到达**的数据段的原始长度 / 实际捕获长度 / 是否被截断 |
 | `payload_head` / `payload_hash` / `entropy` / `printable` | 只基于首段实际捕获的字节。不是完整应用消息；同样的字节流分段不同时哈希也不同 |
-| `prefix_len` / `prefix_hash` | 按 TCP 序列号重组后的**连续**客户端字节流前缀（最多 4096 字节）及其 sha256 前 8 字节。比较时必须连同 `prefix_len`。相同只说明候选匹配，不能证明来源身份或重放因果 |
-| `reasm_flags` | `gap`（后面有数据但中间缺字节）、`conflict`（重叠段内容不一致，保留先到的字节——不一定是服务端协议栈实际采用的字节）、`overflow`（乱序队列或前缀达到上限）、`truncated`（有段因捕获长度丢了尾部）、`retrans`（收到内容一致的重复数据） |
-| `tls_state` | `complete` / `not_client_hello` / `malformed` / `incomplete`（结束、超时 2 秒或到达上限时仍没收齐）。**只有 `complete` 时 `tls_*`、`ja3`、`ja4` 才填写**；跨多个 TLS record 的 ClientHello 会拼起来解析 |
+| `prefix_len` / `prefix_hash` | 固定策略的客户端字节流前缀：按 TCP 序列号重组后的**连续**字节，从流的第 0 字节开始，最多 4096 字节，及其 sha256 前 8 字节。覆盖范围只由 `prefix_stop` 决定，与 TCP 如何分段、ClientHello 后面的数据是否同段到达无关。比较时必须连同 `prefix_len`；短前缀（例如只有几个字节）区分度很低，应按长度分层看，不要和长前缀的相等当成同样的证据。相同只说明候选匹配，不能证明来源身份或重放因果 |
+| `prefix_stop` | 前缀采集结束的条件：`bytes`（前缀满 4096 字节且 TLS 判别已有结论，或重组缓存满 16 KiB）、`window`（首个数据段之后 2 秒，按包时间）、`flow_end`（窗口内连接就结束了）、`snapshot`（窗口内到了 60 秒快照）、`overflow`（乱序暂存达到上限）。TLS 判别结束（例如首字节就能判断“不是 ClientHello”）**不会**结束前缀采集。不同 `prefix_stop` 的前缀不保证覆盖同样的范围 |
+| `reasm_flags` | `gap`（后面有数据但中间缺字节）、`conflict`（重叠段内容不一致）、`overflow`（乱序队列或前缀达到上限）、`truncated`（有段因捕获长度丢了尾部）、`retrans`（收到内容一致的重复数据）。**只描述 `prefix_stop` 之前的观察**：之后到达的客户端字节不再检查，空值不代表整条连接都没有重叠冲突。重叠采用“先到达的字节优先”：每个位置第一次收到的字节（无论当时是否已接上连续前缀）保留，之后的只用于比较。这是采集器的确定规则，不一定是节点协议栈实际采用的字节 |
+| `tls_state` | `complete` / `not_client_hello` / `malformed` / `incomplete` / `conflict`。`malformed`：record 与 handshake 长度都齐了，但内部向量的声明长度与内容不符（越界、尾部多余、元素大小不对）或出现了其他记录；未知扩展按声明长度跳过，不算畸形。`incomplete`：前缀采集结束时仍没收齐（缺口、截断、超时、结束）。`conflict`：语法可以解析，但 ClientHello 所在字节范围内有内容不一致的重叠段，不输出指纹。**只有 `complete` 时 `tls_*`、`ja3`、`ja4` 才填写**；跨多个 TLS record 的 ClientHello 会拼起来解析。冲突只出现在 ClientHello 之后时仍是 `complete`，`reasm_flags` 保留 `conflict` |
 | `first_data_ms` | SYN 到首个数据段的毫秒数 |
 | `out_pkts` / `out_bytes` / `first_resp_ms` / `resp_records` | 仅 `full` 模式：节点方向的数据包统计、SYN 到节点首个数据段的毫秒数、节点响应前 8 个 TLS record 的 `类型:长度` |
 
@@ -83,12 +90,15 @@
 | `auth` | `accepted` / `rejected`：关联到的 xray access 记录的状态（xray 实现中的 access 结果，不等于 REALITY 密码学握手成败）；`unknown`：没有关联到 access 记录——正常浏览器访问、健康检查、未完成的握手、日志缺失都会落在这里，**不等于认证失败，更不等于主动探测**；`not_applicable`：非节点端口（如 SSH） |
 | `auth_assoc` | `matched`（唯一匹配）/ `unmatched` / `ambiguous`（同一来源 ip:port 有多个候选连接，没有传播认证结果）/ `not_applicable` |
 
-xray access 记录只带来源地址，不带入站目标，所以按“来源 ip:port + 时间窗”在候选连接里匹配：
+xray access 记录只带来源地址，不带入站目标（`m.To` 是业务目标，不是节点入站地址），所以按“来源 ip:port + 时间窗”在候选连接里匹配。结论不取决于日志与抓包谁先被处理：
 
-- 日志比抓包先到：日志最多保留 10 秒，等连接出现后应用（`stats.pending_logs_expired` 为一直没等到的数量）
-- 连接已输出 `final` 后 2 秒内的迟到日志：输出 `correction`
+- **候选**：同一来源 ip:port、节点端口、首次观察时间不晚于日志时间 + 2 秒、且没有在日志时间 2 秒之前就已结束的连接
+- **候选窗口**：日志处理后先不绑定，等到日志时间 + 3 秒（2 秒候选范围 + 1 秒处理先后差）再看候选集合：唯一 → `matched`；多个 → `ambiguous`；还没有候选 → 继续等，最多 10 秒（`stats.pending_logs_expired` 为一直没等到的数量）。已经有多个候选时立即标记 `ambiguous`（再出现候选也不会变成唯一）
+- 窗口内观察到关闭的连接会推迟输出 `final`（最多 3 秒），让 `final` 直接带上结论，减少 `correction`
+- 已决定的日志保留 30 秒：之后才处理到的候选（抓包处理落后）会把原来的 `matched` 撤回为 `ambiguous`，`auth` 回到 `unknown`，已输出的连接发 `correction`
 - 同一来源端口的旧连接结束 2 秒后，日志不会再匹配旧连接，避免污染端口复用后的新连接
-- 有多个候选时标记 `ambiguous`，不把结果传播给任何一个
+- 有多个候选时标记 `ambiguous`，不把结果传播给任何一个；被另一条日志唯一匹配过的连接保持 `matched`
+- 这仍是基于时间窗的推定，不是连接级标识。根本的改善需要 xray 日志携带入站本地地址/端口或连接 ID
 
 ## 采样与限速
 
@@ -97,7 +107,7 @@ xray access 记录只带来源地址，不带入站目标，所以按“来源 i
 
 ## 数据质量统计（`kind=stats`）
 
-`rate_dropped`、`sampled_out`、`sink_chan_dropped`、`sink_buffer_dropped`（各种主动丢弃）；`flow_table_full`；`midstream_flows`；`tls_incomplete`、`tls_malformed`；`reasm_conflict`、`reasm_overflow`、`cap_truncated`；`assoc_unmatched`、`assoc_ambiguous`、`pending_logs_dropped`、`pending_logs_expired`、`late_corrections`；`kernel_packets`、`kernel_drops`（来自 `PACKET_STATISTICS`，取不到时为 `"unavailable"`，**不是 0**）；`sink_schema`（启动时表结构检查结果）。
+`rate_dropped`、`sampled_out`、`sink_chan_dropped`、`sink_buffer_dropped`（各种主动丢弃）；`flow_table_full`；`midstream_flows`；`tls_incomplete`、`tls_malformed`、`tls_conflict`；`reasm_conflict`、`reasm_overflow`、`cap_truncated`；`assoc_unmatched`、`assoc_ambiguous`、`pending_logs_dropped`、`pending_logs_expired`、`late_corrections`；`kernel_packets`、`kernel_drops`（来自 `PACKET_STATISTICS`，取不到时为 `"unavailable"`，**不是 0**）；`sink_schema`（启动时表结构检查结果）。
 
 ## 配置
 
@@ -138,10 +148,19 @@ xray access 记录只带来源地址，不带入站目标，所以按“来源 i
 ## ClickHouse
 
 - 新安装：`clickhouse-client --multiquery < probelog/schema.sql`
-- 从 v1 升级：`clickhouse-client --multiquery < probelog/migrations/002_v2.sql`。**先升级表、再升级节点**：新版不再跳过未知字段，表结构落后时写入会直接失败，并在 `stats.sink_schema` 里列出缺少的列（旧版会静默丢掉新字段）。
+- 从 v1 升级：依次执行 `migrations/002_v2.sql`、`migrations/003_v3.sql`；从 v2 升级：只执行 `003_v3.sql`。**先升级表、再升级节点**：节点不跳过未知字段，表结构落后时写入会直接失败，并在 `stats.sink_schema` 里列出缺少的列。
 - 查询示例（取每个连接的最新记录、区分新旧语义等）：`probelog/queries.sql`
 - 去重：上传失败重试会发送完全相同的批次，表开启了 `non_replicated_deduplication_window`；查询时仍建议按 `flow_id` 取最大 `revision`、按 `event_id` 去重。
+- v2 行（`schema_version = 2`）与 v3 的差异，不要混在一起比较：非 TLS 前缀在首字节判断后就停止采集（长度取决于分段，没有 `prefix_stop`）；`tls_state=complete` 可能包含 ClientHello 内的重叠冲突和漏检的内部长度错误；`handshake=established` 只要有客户端数据或 FIN 就会给出（v3 中多为 `inferred`）；日志先到时会绑定第一个出现的连接，final 后的歧义没有 correction；`full` 模式下按入站包计时回收。旧行不会自动获得新语义保证。
 - 旧数据：`schema_version < 2` 的行是 v1 语义（以来源 ip:port 为流键、按到达顺序拼接、`auth=none` 只表示没关联到 access 记录、`flow_end=fin/rst` 只是观察到入站 FIN/RST），不要和新行混在一起解释。
+
+## 可比较样本的统一门槛
+
+`queries.sql` 和面板使用同一套条件（新的比较查询也应沿用）：
+
+- TLS 指纹：`schema_version >= 3 AND tls_state = 'complete'`。`conflict` / `malformed` / `incomplete` 不进入指纹统计
+- 前缀：`schema_version >= 3 AND prefix_hash != '' AND reasm_flags NOT LIKE '%conflict%'`，按 `(prefix_len, prefix_hash)` 分组；需要时再按 `prefix_stop` 分层。`gap` / `truncated` 不破坏已采集的连续字节，只说明前缀比实际到达的数据短，因此不排除，但 `prefix_len` 会不同
+- 握手：`handshake = 'established'` 才是核对过的证据，`inferred` 只是推定
 
 ## 分析面板（配套项目）
 
