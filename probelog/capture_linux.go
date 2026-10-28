@@ -9,6 +9,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -20,26 +21,32 @@ const portWatchInterval = 5 * time.Second
 
 type capturer interface {
 	Close()
+	Stats() map[string]any
 }
 
-// afPacketCapture 用 AF_PACKET(SOCK_DGRAM) 抓入站包，过滤器随监听端口变化重建。需要 CAP_NET_RAW。
+// afPacketCapture 用 AF_PACKET(SOCK_DGRAM) 抓包，过滤器随监听端口变化重建。需要 CAP_NET_RAW。
 type afPacketCapture struct {
 	r        *Recorder
 	fd       int
+	mode     string
 	loopback map[int]bool
 	extra    []uint16
 	curTCP   []uint16
 	curUDP   []uint16
 	done     chan struct{}
 	wg       sync.WaitGroup
+
+	kernelPackets atomic.Uint64
+	kernelDrops   atomic.Uint64
+	statsErr      atomic.Bool
 }
 
 func htons(v uint16) uint16 {
 	return binary.BigEndian.Uint16(binary.NativeEndian.AppendUint16(nil, v))
 }
 
-func newCapturer(r *Recorder, iface string, extra []int) (capturer, error) {
-	c := &afPacketCapture{r: r, loopback: map[int]bool{}, done: make(chan struct{})}
+func newCapturer(r *Recorder, iface string, extra []int, mode string) (capturer, error) {
+	c := &afPacketCapture{r: r, mode: mode, loopback: map[int]bool{}, done: make(chan struct{})}
 	for _, p := range extra {
 		if p > 0 && p < 65536 {
 			c.extra = append(c.extra, uint16(p))
@@ -143,7 +150,7 @@ func (c *afPacketCapture) watchedPorts() (tcp, udp []uint16) {
 }
 
 func (c *afPacketCapture) attach(tcp, udp []uint16) error {
-	raw, err := buildFilter(tcp, udp)
+	raw, err := buildFilter(tcp, udp, c.mode)
 	if err != nil {
 		return err
 	}
@@ -189,7 +196,8 @@ func (c *afPacketCapture) readLoop() {
 			return
 		default:
 		}
-		n, from, err := unix.Recvfrom(c.fd, buf, 0)
+		// MSG_TRUNC：返回值是原始包长度（可能大于捕获到的字节数）
+		n, from, err := unix.Recvfrom(c.fd, buf, unix.MSG_TRUNC)
 		if err != nil {
 			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
 				continue
@@ -202,15 +210,37 @@ func (c *afPacketCapture) readLoop() {
 		if !ok || c.loopback[sll.Ifindex] {
 			continue
 		}
+		outgoing := sll.Pkttype == packetOutgoing
+		if !outgoing && sll.Pkttype != unix.PACKET_HOST {
+			continue
+		}
 		c.r.stats.packets.Add(1)
-		p, err := parsePacket(buf[:n], htons(sll.Protocol))
+		captured := min(n, len(buf))
+		p, err := parsePacket(buf[:captured], htons(sll.Protocol), n)
 		if err != nil {
 			c.r.stats.parseErrors.Add(1)
 			continue
 		}
-		if p.src.IsLoopback() {
+		p.outgoing = outgoing
+		if p.src.IsLoopback() || p.dst.IsLoopback() {
 			continue
 		}
 		c.r.flows.handle(p, time.Now())
+	}
+}
+
+// Stats 读取内核 PACKET_STATISTICS（每次读取后内核清零，这里累加）。
+// 拿不到时明确报告不可用，而不是报 0。
+func (c *afPacketCapture) Stats() map[string]any {
+	st, err := unix.GetsockoptTpacketStats(c.fd, unix.SOL_PACKET, unix.PACKET_STATISTICS)
+	if err != nil {
+		c.statsErr.Store(true)
+		return map[string]any{"kernel_drops": "unavailable", "kernel_stats_error": err.Error()}
+	}
+	c.kernelPackets.Add(uint64(st.Packets))
+	c.kernelDrops.Add(uint64(st.Drops))
+	return map[string]any{
+		"kernel_packets": c.kernelPackets.Load(),
+		"kernel_drops":   c.kernelDrops.Load(),
 	}
 }

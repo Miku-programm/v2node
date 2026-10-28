@@ -32,38 +32,82 @@ func isGREASE(v uint16) bool {
 	return v&0x0f0f == 0x0a0a && v>>8 == v&0xff
 }
 
-// clientHelloNeed 返回读完整个 ClientHello 所需的字节数；不是 TLS 握手时返回 -1
-func clientHelloNeed(b []byte) int {
-	if len(b) < 5 || b[0] != 0x16 || b[1] != 3 {
-		return -1
+// ClientHello 解析状态（tls_state 列）
+const (
+	tlsNeedMore   = "need_more"        // 数据还不够判断，继续等
+	tlsNotCH      = "not_client_hello" // 已能确定不是 TLS ClientHello
+	tlsMalformed  = "malformed"        // 像 TLS ClientHello 但结构不合法
+	tlsComplete   = "complete"         // 完整解析，指纹可用
+	tlsIncomplete = "incomplete"       // 结束时仍是 need_more（缺口、截断、超时或连接结束）
+)
+
+const (
+	maxTLSRecordLen     = 16384 + 2048
+	maxClientHelloBytes = 1 << 17
+)
+
+// classifyClientHello 判断字节流前缀是否是 TLS ClientHello，跨多个 handshake record 时先拼接再解析。
+// 只有返回 tlsComplete 时 ClientHello 可用。
+func classifyClientHello(b []byte) (string, *clientHello) {
+	if len(b) == 0 {
+		return tlsNeedMore, nil
 	}
-	if len(b) >= 9 && b[5] == 1 {
-		hsLen := int(b[6])<<16 | int(b[7])<<8 | int(b[8])
-		return 9 + hsLen
+	if b[0] != 0x16 || (len(b) >= 2 && b[1] != 3) {
+		return tlsNotCH, nil
 	}
-	return 5 + int(binary.BigEndian.Uint16(b[3:5]))
+	var hs []byte
+	hsLen := -1
+	for {
+		if len(b) < 5 {
+			return tlsNeedMore, nil
+		}
+		if b[0] != 0x16 || b[1] != 3 {
+			// ClientHello 还没收齐就出现了别的记录
+			return tlsMalformed, nil
+		}
+		l := int(binary.BigEndian.Uint16(b[3:5]))
+		if l == 0 || l > maxTLSRecordLen {
+			return tlsMalformed, nil
+		}
+		if len(b) < 5+l {
+			return tlsNeedMore, nil
+		}
+		hs = append(hs, b[5:5+l]...)
+		b = b[5+l:]
+		if hsLen < 0 && len(hs) >= 4 {
+			if hs[0] != 1 {
+				return tlsNotCH, nil
+			}
+			hsLen = int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
+			if hsLen > maxClientHelloBytes {
+				return tlsMalformed, nil
+			}
+		}
+		if hsLen >= 0 && len(hs) >= hsLen+4 {
+			break
+		}
+	}
+	ch, err := parseHandshake(hs[:hsLen+4])
+	if err != nil {
+		return tlsMalformed, nil
+	}
+	return tlsComplete, ch
 }
 
-// parseClientHello 从 TLS 记录开始解析 ClientHello。跨多个记录的 ClientHello 会先把记录体拼起来。
+// parseClientHello 解析完整的 ClientHello（测试与工具使用）
 func parseClientHello(b []byte) (*clientHello, error) {
-	var hs []byte
-	for len(b) >= 5 && b[0] == 0x16 {
-		l := int(binary.BigEndian.Uint16(b[3:5]))
-		end := min(5+l, len(b))
-		hs = append(hs, b[5:end]...)
-		b = b[end:]
+	state, ch := classifyClientHello(b)
+	if state != tlsComplete {
+		return nil, fmt.Errorf("%w: %s", errNotClientHello, state)
 	}
-	if len(hs) < 4 || hs[0] != 1 {
-		return nil, errNotClientHello
-	}
+	return ch, nil
+}
+
+// parseHandshake 解析一条完整的 ClientHello handshake 消息（含 4 字节头）
+func parseHandshake(hs []byte) (*clientHello, error) {
 	hsLen := int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
 	ch := &clientHello{length: hsLen + 4}
-	body := hs[4:]
-	if len(body) < hsLen {
-		return nil, fmt.Errorf("truncated client hello %d/%d", len(body), hsLen)
-	}
-	body = body[:hsLen]
-	r := reader{b: body}
+	r := reader{b: hs[4 : 4+hsLen]}
 	ch.legacyVer = r.u16()
 	r.skip(32)
 	sid := r.vec8()
@@ -118,6 +162,9 @@ func parseClientHello(b []byte) (*clientHello, error) {
 				ch.supVers = append(ch.supVers, binary.BigEndian.Uint16(v[i:]))
 			}
 		}
+	}
+	if exts.err != nil || exts.left() != 0 || r.left() != 0 {
+		return nil, errors.New("malformed client hello extensions")
 	}
 	return ch, nil
 }
@@ -248,6 +295,28 @@ func fillTLS(e *Event, ch *clientHello) {
 	e.JA4 = ch.ja4()
 	e.TLSSIDLn = uint8(ch.sidLen)
 	e.TLSCHLen = uint32(ch.length)
+}
+
+// tlsRecordSummary 从字节流前缀读出前 max 个 TLS record 的“类型:长度”序列，只读记录头，不解密。
+// 遇到不是 TLS 记录的数据时返回 "non_tls"。
+func tlsRecordSummary(b []byte, max int) string {
+	var parts []string
+	for len(parts) < max && len(b) >= 5 {
+		typ := b[0]
+		if typ < 20 || typ > 24 || b[1] != 3 {
+			if len(parts) == 0 {
+				return "non_tls"
+			}
+			break
+		}
+		l := int(binary.BigEndian.Uint16(b[3:5]))
+		parts = append(parts, strconv.Itoa(int(typ))+":"+strconv.Itoa(l))
+		if len(b) < 5+l {
+			break
+		}
+		b = b[5+l:]
+	}
+	return strings.Join(parts, ",")
 }
 
 // reader 是一个出错后只返回空值的简单字节读取器

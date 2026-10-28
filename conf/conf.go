@@ -23,6 +23,7 @@ type ProbeLogConfig struct {
 	NodeName         string           `mapstructure:"NodeName"`
 	Interface        string           `mapstructure:"Interface"`
 	Capture          bool             `mapstructure:"Capture"`
+	Direction        string           `mapstructure:"Direction"` // inbound / control / full
 	ExtraPorts       []int            `mapstructure:"ExtraPorts"`
 	GeoTags          []string         `mapstructure:"GeoTags"`
 	MaxEventsPerSec  int              `mapstructure:"MaxEventsPerSec"`
@@ -69,6 +70,7 @@ func New() *Conf {
 		},
 		ProbeLogConfig: ProbeLogConfig{
 			Capture:          true,
+			Direction:        "control",
 			GeoTags:          []string{"cn"},
 			MaxEventsPerSec:  2000,
 			MaxPerSourceSec:  200,

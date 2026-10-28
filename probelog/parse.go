@@ -44,21 +44,28 @@ type packet struct {
 
 	flags   uint8
 	seq     uint32
+	ack     uint32
 	win     uint16
 	opts    string
 	mss     uint16
 	tsVal   uint32
 	tsEcr   uint32
-	payload []byte
+	payload []byte // 实际捕获到的负载
+
+	payloadWire int  // 按 IP 长度字段（或捕获元数据）推算的原始负载长度
+	truncated   bool // 负载因捕获长度限制丢了尾部
+	outgoing    bool // 本机发出的包（PACKET_OUTGOING）
 
 	icmpType uint8
 	icmpCode uint8
 }
 
-// parsePacket 解析从网络层开始的数据（AF_PACKET SOCK_DGRAM）
-func parsePacket(data []byte, ethProto uint16) (*packet, error) {
+// parsePacket 解析从网络层开始的数据（AF_PACKET SOCK_DGRAM）。
+// data 是实际捕获的字节，origLen 是内核报告的原始长度（MSG_TRUNC，未知时为 0）。
+func parsePacket(data []byte, ethProto uint16, origLen int) (*packet, error) {
 	p := &packet{}
 	var l4 []byte
+	wireLen := 0 // 原始 IP 包长度
 	switch ethProto {
 	case ethPIPv4:
 		if len(data) < 20 || data[0]>>4 != 4 {
@@ -71,6 +78,9 @@ func parsePacket(data []byte, ethProto uint16) (*packet, error) {
 		}
 		if total >= ihl && total < len(data) {
 			data = data[:total]
+		}
+		if total >= ihl {
+			wireLen = total
 		}
 		p.ipID = binary.BigEndian.Uint16(data[4:6])
 		fragField := binary.BigEndian.Uint16(data[6:8])
@@ -91,6 +101,9 @@ func parsePacket(data []byte, ethProto uint16) (*packet, error) {
 		plen := int(binary.BigEndian.Uint16(data[4:6]))
 		if 40+plen < len(data) {
 			data = data[:40+plen]
+		}
+		if plen > 0 {
+			wireLen = 40 + plen
 		}
 		p.ttl = data[7]
 		p.src = netip.AddrFrom16([16]byte(data[8:24]))
@@ -122,6 +135,7 @@ func parsePacket(data []byte, ethProto uint16) (*packet, error) {
 		p.sport = binary.BigEndian.Uint16(l4[0:2])
 		p.dport = binary.BigEndian.Uint16(l4[2:4])
 		p.seq = binary.BigEndian.Uint32(l4[4:8])
+		p.ack = binary.BigEndian.Uint32(l4[8:12])
 		off := int(l4[12]>>4) * 4
 		if off < 20 || len(l4) < off {
 			return nil, errShortPacket
@@ -130,6 +144,7 @@ func parsePacket(data []byte, ethProto uint16) (*packet, error) {
 		p.win = binary.BigEndian.Uint16(l4[14:16])
 		p.parseTCPOptions(l4[20:off])
 		p.payload = l4[off:]
+		p.setWire(len(data)-len(p.payload), wireLen, origLen)
 	case ipProtoUDP:
 		if len(l4) < 8 {
 			return nil, errShortPacket
@@ -137,6 +152,7 @@ func parsePacket(data []byte, ethProto uint16) (*packet, error) {
 		p.sport = binary.BigEndian.Uint16(l4[0:2])
 		p.dport = binary.BigEndian.Uint16(l4[2:4])
 		p.payload = l4[8:]
+		p.setWire(len(data)-len(p.payload), wireLen, origLen)
 	case ipProtoICMP, ipProtoICMPv6:
 		if len(l4) < 2 {
 			return nil, errShortPacket
@@ -147,6 +163,19 @@ func parsePacket(data []byte, ethProto uint16) (*packet, error) {
 		return nil, errors.New("unsupported l4")
 	}
 	return p, nil
+}
+
+// setWire 计算原始负载长度与截断状态。hdr 为负载之前的头部字节数。
+// IP 长度字段为 0（如超大 GRO 包）时退回使用捕获元数据给出的原始长度。
+func (p *packet) setWire(hdr, wireLen, origLen int) {
+	if wireLen == 0 {
+		wireLen = origLen
+	}
+	p.payloadWire = len(p.payload)
+	if wireLen > hdr {
+		p.payloadWire = wireLen - hdr
+	}
+	p.truncated = p.payloadWire > len(p.payload)
 }
 
 // parseTCPOptions 生成 p0f 风格的选项序列，如 M1460,S,T,N,W7
@@ -226,9 +255,28 @@ func fillIPFingerprint(e *Event, p *packet) {
 	}
 }
 
-// fillPayloadFeatures 写入首包长度、头部、哈希、熵和可打印字符比例
+// fillFirstSegment 写入首个捕获数据段的特征：原始长度、实际捕获长度、截断标记、头部、哈希、熵和可打印比例。
+// 这些只描述“第一个到达的数据段”，不是完整的应用层消息；熵和哈希只对实际捕获的字节计算。
+func fillFirstSegment(e *Event, p *packet, headBytes int) {
+	e.PayloadLen = uint32(p.payloadWire)
+	e.PayloadCapLen = uint32(len(p.payload))
+	if p.truncated {
+		e.PayloadTruncated = 1
+	}
+	fillPayloadFeatures(e, p.payload, headBytes)
+}
+
+// prefixHash 对重组后的连续前缀计算哈希（sha256 前 8 字节，hex）。比较时必须连同 prefix_len 一起比较。
+func prefixHash(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
+}
+
+// fillPayloadFeatures 写入头部、哈希、熵和可打印字符比例（基于传入的字节）
 func fillPayloadFeatures(e *Event, b []byte, headBytes int) {
-	e.PayloadLen = uint32(len(b))
 	if len(b) == 0 {
 		return
 	}

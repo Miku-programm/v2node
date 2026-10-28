@@ -4,6 +4,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	applog "github.com/xtls/xray-core/app/log"
 	"github.com/xtls/xray-core/common/log"
@@ -105,7 +106,9 @@ func (r *Recorder) onAccess(m *log.AccessMessage) {
 	proto, ip, port := parseXrayAddr(m.From)
 	status := string(m.Status)
 	if ip != "" {
-		r.flows.markAuth(proto == "udp", ip, port, status)
+		for _, c := range r.flows.onAccess(proto == "udp", ip, port, status, time.Now()) {
+			r.emit(c)
+		}
 	}
 	if m.Status == log.AccessAccepted && !r.sampleAuthed() {
 		return

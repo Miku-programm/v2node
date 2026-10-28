@@ -42,7 +42,10 @@ func TestCaptureLive(t *testing.T) {
 			go func() {
 				buf := make([]byte, 4096)
 				c.SetReadDeadline(time.Now().Add(3 * time.Second))
-				c.Read(buf)
+				if n, _ := c.Read(buf); n > 0 {
+					// 回一段 TLS record 形状的响应，供 full 模式记录 resp_records
+					c.Write([]byte{22, 3, 3, 0, 4, 2, 0, 0, 0, 20, 3, 3, 0, 1, 1, 23, 3, 3, 0, 3, 9, 9, 9})
+				}
 				c.Close()
 			}()
 		}
@@ -54,6 +57,9 @@ func TestCaptureLive(t *testing.T) {
 	c.GeoTags = nil
 	c.NodeName = "live"
 	c.LocalFile = file
+	if d := os.Getenv("PROBELOG_DIRECTION"); d != "" {
+		c.Direction = d
+	}
 	RegisterNode(NodePort{Tag: "live", Type: "vless", Security: "reality", Port: uint16(port)})
 	defer UnregisterNode("live")
 	if err := Start(&c); err != nil {

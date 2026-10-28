@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,6 +48,7 @@ type sink struct {
 	sent          atomic.Uint64
 	sendErrors    atomic.Uint64
 	lastError     atomic.Value
+	schemaStatus  atomic.Value
 }
 
 func newSink(c *conf.ClickHouseConfig, localFile string) (*sink, error) {
@@ -74,10 +77,12 @@ func newSink(c *conf.ClickHouseConfig, localFile string) (*sink, error) {
 		v := url.Values{}
 		v.Set("query", q)
 		v.Set("date_time_input_format", "best_effort")
-		v.Set("input_format_skip_unknown_fields", "1")
+		// 显式关闭跳过未知字段（新版 ClickHouse 默认开启）：表结构落后于事件模型时让写入明确失败，而不是静默丢掉新字段
+		v.Set("input_format_skip_unknown_fields", "0")
 		s.endpoint = strings.TrimRight(c.URL, "/") + "/?" + v.Encode()
 		s.senderWG.Add(1)
 		go s.sendLoop()
+		go s.checkSchema()
 	}
 	s.batcherWG.Add(1)
 	go s.batchLoop()
@@ -106,7 +111,75 @@ func (s *sink) Stats() map[string]any {
 	if e, ok := s.lastError.Load().(string); ok && e != "" {
 		m["sink_last_error"] = e
 	}
+	if e, ok := s.schemaStatus.Load().(string); ok && e != "" {
+		m["sink_schema"] = e
+	}
 	return m
+}
+
+// eventColumns 返回事件模型中的所有列名
+func eventColumns() []string {
+	var cols []string
+	t := reflect.TypeOf(Event{})
+	for i := 0; i < t.NumField(); i++ {
+		tag := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
+		if tag != "" && tag != "-" {
+			cols = append(cols, tag)
+		}
+	}
+	return cols
+}
+
+// checkSchema 启动时检查目标表是否包含事件模型的全部列。写入账号无权读 system.columns 时只记录无法检查。
+func (s *sink) checkSchema() {
+	q := "SELECT name FROM system.columns WHERE database = {db:String} AND table = {t:String} FORMAT TabSeparated"
+	v := url.Values{}
+	v.Set("param_db", s.cfg.Database)
+	v.Set("param_t", s.cfg.Table)
+	ctx, cancel := context.WithTimeout(context.Background(), s.client.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.cfg.URL, "/")+"/?"+v.Encode(), strings.NewReader(q))
+	if err != nil {
+		return
+	}
+	if s.cfg.Username != "" {
+		req.Header.Set("X-ClickHouse-User", s.cfg.Username)
+		req.Header.Set("X-ClickHouse-Key", s.cfg.Password)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		s.schemaStatus.Store("unchecked: " + err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		s.schemaStatus.Store("unchecked: http " + strconv.Itoa(resp.StatusCode))
+		return
+	}
+	have := map[string]bool{}
+	for _, l := range strings.Split(string(body), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			have[l] = true
+		}
+	}
+	if len(have) == 0 {
+		s.schemaStatus.Store("table not found or not visible")
+		log.Error("ProbeLog: ClickHouse table not found or not visible to this user; run probelog/schema.sql")
+		return
+	}
+	var missing []string
+	for _, c := range eventColumns() {
+		if !have[c] {
+			missing = append(missing, c)
+		}
+	}
+	if len(missing) > 0 {
+		s.schemaStatus.Store("missing columns: " + strings.Join(missing, ","))
+		log.WithField("missing", missing).Error("ProbeLog: ClickHouse table is older than the event model, inserts will fail; apply probelog/migrations")
+		return
+	}
+	s.schemaStatus.Store("ok")
 }
 
 func (s *sink) Close() {
