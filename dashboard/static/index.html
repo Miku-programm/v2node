@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>v2node 探测分析</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>探测分析</h1>
+  </div>
+  <div class="controls">
+    <label>时间
+      <select id="hours">
+        <option value="1">1 小时</option>
+        <option value="6">6 小时</option>
+        <option value="24" selected>24 小时</option>
+        <option value="72">3 天</option>
+        <option value="168">7 天</option>
+        <option value="720">30 天</option>
+      </select>
+    </label>
+    <label>节点
+      <select id="node"><option value="">全部</option></select>
+    </label>
+    <label class="check"><input type="checkbox" id="auto"> 每分钟刷新</label>
+    <button id="refresh" type="button">刷新</button>
+  </div>
+</header>
+
+<main>
+  <section class="kpis" id="kpis"></section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>事件时间线</h2>
+      <p class="hint">未认证流 = 到节点端口、从 SYN 开始、xray 没有接受的 TCP 连接。主动探测通常集中在这一类。</p>
+    </div>
+    <div id="timeline" class="chart tall"></div>
+  </section>
+
+  <nav class="tabs" id="tabs"></nav>
+  <section id="panel"></section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

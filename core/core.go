@@ -8,6 +8,7 @@ import (
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core/app/dispatcher"
 	_ "github.com/wyx2685/v2node/core/distro/all"
+	"github.com/wyx2685/v2node/probelog"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/serial"
@@ -61,6 +62,7 @@ func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 	v.ihm = v.Server.GetFeature(inbound.ManagerType()).(inbound.Manager)
 	v.ohm = v.Server.GetFeature(outbound.ManagerType()).(outbound.Manager)
 	v.dispatcher = v.Server.GetFeature(routing.DispatcherType()).(*dispatcher.DefaultDispatcher)
+	probelog.HookXrayLog(v.Server)
 	return nil
 }
 

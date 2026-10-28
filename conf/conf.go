@@ -11,9 +11,39 @@ const DefaultNodeRetryCount = 1
 const DefaultNodeTimeout = 15
 
 type Conf struct {
-	LogConfig   LogConfig    `mapstructure:"Log"`
-	NodeConfigs []NodeConfig `mapstructure:"Nodes"`
-	PprofPort   int          `mapstructure:"PprofPort"`
+	LogConfig      LogConfig      `mapstructure:"Log"`
+	NodeConfigs    []NodeConfig   `mapstructure:"Nodes"`
+	PprofPort      int            `mapstructure:"PprofPort"`
+	ProbeLogConfig ProbeLogConfig `mapstructure:"ProbeLog"`
+}
+
+// ProbeLogConfig 控制探测/扫描行为记录（抓包 + xray 日志）以及上传 ClickHouse
+type ProbeLogConfig struct {
+	Enable           bool             `mapstructure:"Enable"`
+	NodeName         string           `mapstructure:"NodeName"`
+	Interface        string           `mapstructure:"Interface"`
+	Capture          bool             `mapstructure:"Capture"`
+	ExtraPorts       []int            `mapstructure:"ExtraPorts"`
+	GeoTags          []string         `mapstructure:"GeoTags"`
+	MaxEventsPerSec  int              `mapstructure:"MaxEventsPerSec"`
+	MaxPerSourceSec  int              `mapstructure:"MaxPerSourceSec"`
+	PayloadHeadBytes int              `mapstructure:"PayloadHeadBytes"`
+	AuthedSampleRate float64          `mapstructure:"AuthedSampleRate"`
+	XrayLogLevel     string           `mapstructure:"XrayLogLevel"`
+	LocalFile        string           `mapstructure:"LocalFile"`
+	ClickHouse       ClickHouseConfig `mapstructure:"ClickHouse"`
+}
+
+type ClickHouseConfig struct {
+	URL           string `mapstructure:"URL"`
+	Database      string `mapstructure:"Database"`
+	Table         string `mapstructure:"Table"`
+	Username      string `mapstructure:"Username"`
+	Password      string `mapstructure:"Password"`
+	BatchSize     int    `mapstructure:"BatchSize"`
+	FlushInterval int    `mapstructure:"FlushInterval"`
+	BufferSize    int    `mapstructure:"BufferSize"`
+	Timeout       int    `mapstructure:"Timeout"`
 }
 
 type LogConfig struct {
@@ -36,6 +66,23 @@ func New() *Conf {
 			Level:  "info",
 			Output: "",
 			Access: "none",
+		},
+		ProbeLogConfig: ProbeLogConfig{
+			Capture:          true,
+			GeoTags:          []string{"cn"},
+			MaxEventsPerSec:  2000,
+			MaxPerSourceSec:  200,
+			PayloadHeadBytes: 64,
+			AuthedSampleRate: 1,
+			XrayLogLevel:     "info",
+			ClickHouse: ClickHouseConfig{
+				Database:      "v2node",
+				Table:         "probe_events",
+				BatchSize:     2000,
+				FlushInterval: 5,
+				BufferSize:    200000,
+				Timeout:       15,
+			},
 		},
 	}
 }

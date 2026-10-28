@@ -15,6 +15,7 @@ import (
 	"github.com/wyx2685/v2node/core"
 	"github.com/wyx2685/v2node/limiter"
 	"github.com/wyx2685/v2node/node"
+	"github.com/wyx2685/v2node/probelog"
 )
 
 var (
@@ -78,6 +79,11 @@ func serverHandle(_ *cobra.Command, _ []string) {
 			}
 		}()
 	}
+	//probe log
+	if err := probelog.Start(&c.ProbeLogConfig); err != nil {
+		log.WithField("err", err).Error("Start probe log failed")
+	}
+	defer probelog.Stop()
 	//init limiter
 	limiter.Init()
 	//get node info
@@ -127,6 +133,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		select {
 		case <-osSignals:
 			log.Info("收到退出信号，正在关闭程序...")
+			probelog.Stop()
 			os.Exit(0)
 		case <-reloadCh:
 			log.Info("收到重启信号，正在重新加载配置...")
@@ -156,6 +163,9 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	newConf := conf.New()
 	if err := newConf.LoadFromPath(config); err != nil {
 		return err
+	}
+	if err := probelog.Start(&newConf.ProbeLogConfig); err != nil {
+		log.WithField("err", err).Error("Start probe log failed")
 	}
 
 	switch newConf.LogConfig.Level {
