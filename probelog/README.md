@@ -1,6 +1,6 @@
 # 探测日志（ProbeLog）
 
-记录节点收到的扫端口、主动探测和连接行为，批量上传到 ClickHouse，用 `v2node dashboard` 分析。
+记录节点收到的扫端口、主动探测和连接行为，批量上传到 ClickHouse。数据用独立项目 probe-dashboard 读取分析，v2node 本身不包含面板。
 
 ## 采集内容
 
@@ -74,22 +74,6 @@ clickhouse-client --multiquery < probelog/schema.sql
 
 `schema.sql` 末尾有写入账号（只 INSERT）和只读账号的示例。默认保留 30 天。
 
-## 分析面板
+## 分析
 
-```bash
-V2NODE_CH_PASSWORD=... V2NODE_DASH_PASSWORD=... \
-  v2node dashboard --listen 127.0.0.1:8088 \
-    --ch-url http://127.0.0.1:8123 --ch-user v2node_reader \
-    --auth-user admin
-```
-
-面板是单独的进程，前端打包在二进制里，ClickHouse 账号只在服务端使用。`--raw-sql` 打开后可在面板里执行只读 SQL。对外开放时请放在 HTTPS 反向代理后面，并设置 `--auth-user`。
-
-面板页：
-
-- **探测流量**：按来源聚合的未认证流（“已认证=0”的来源最可疑）和每条流的明细
-- **扫端口**：扫描源和扫描器 SYN 指纹
-- **重放检测**：同一首包哈希出现在多个 IP 上
-- **指纹聚类**：按 TTL / 窗口 / TCP 选项 / JA4 聚合探测器
-- **长度与时机**：探测首包长度分布；探测距同端口上一次用户连接的时间
-- **SNI / 端口 / 地区**、**UDP**、**Xray 日志**、**IP 查询**、**SQL**、**采集状态**
+v2node 只负责采集和写入。查看数据请使用独立的 `probe-dashboard` 项目，它只读取 ClickHouse 中的 `probe_events` 表；也可以直接用 clickhouse-client 查询。
