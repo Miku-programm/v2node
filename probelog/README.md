@@ -74,6 +74,10 @@ clickhouse-client --multiquery < probelog/schema.sql
 
 `schema.sql` 末尾有写入账号（只 INSERT）和只读账号的示例。默认保留 30 天。
 
-## 分析
+## 分析面板（配套项目）
 
-v2node 只负责采集和写入。查看数据请使用独立的 `probe-dashboard` 项目，它只读取 ClickHouse 中的 `probe_events` 表；也可以直接用 clickhouse-client 查询。
+v2node 只负责采集和写入，本身不包含面板。查看和分析数据请配套使用 **[Miku-programm/probe-dashboard](https://github.com/Miku-programm/probe-dashboard)**：它只读取 ClickHouse 中的 `probe_events` 表，按本目录 `schema.sql` 的表结构编写查询。
+
+- 两者是独立程序，可以部署在不同机器上，唯一的约定是 `schema.sql` 的表结构
+- 修改 `schema.sql` 或事件字段含义时，需要同步更新 probe-dashboard
+- 也可以不用面板，直接用 clickhouse-client 查询
