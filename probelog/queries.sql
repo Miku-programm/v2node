@@ -1,5 +1,5 @@
--- probe_events 查询示例（schema_version 3）
--- v2 版本的查询曾在 ClickHouse 26.11 上执行验证；v3 新增的条件（prefix_stop、hs_flags、tls_state=conflict）尚未在真实 ClickHouse 上执行。
+-- probe_events 查询示例（schema_version 4）
+-- v2 版本的查询曾在 ClickHouse 26.11 上执行验证；v3/v4 新增的条件（prefix_stop、hs_flags、tls_state=conflict、quic_*、第 8 条）尚未在真实 ClickHouse 上执行。
 -- 可比较样本的统一门槛见 README「可比较样本的统一门槛」，面板使用同样的条件。
 
 -- 1. 每个连接实例只取一行：同一 flow_id 取 revision 最大的记录（final / correction 优先于 snapshot）。
@@ -54,6 +54,28 @@ FROM v2node.flows_latest
 WHERE schema_version >= 3 AND kind = 'tcp_flow' AND ts > now() - INTERVAL 1 DAY
 GROUP BY obs_mode, close_by, flow_end, handshake, hs_flags
 ORDER BY count() DESC;
+
+-- 8. QUIC：疑似在 Initial 之后被切断的流（GFW 按 SNI 封锁 QUIC 的节点侧表现，只是候选）。
+--    gfw_inspects：论文中 GFW 只检查源端口 > 目的端口的包；sni_first = full 表示 SNI 完整落在第一个数据报里。
+--    next_gap_s：同一客户端 IP 到同一端口的下一条流间隔，封锁期约 180 秒。
+SELECT ts, node, src_ip, src_port, dst_port, src_port > dst_port AS gfw_inspects, quic_ver, tls_sni, quic_sni_first,
+       quic_initials, flow_pkts, if(next_ts > ts, dateDiff('second', ts, next_ts), NULL) AS next_gap_s
+FROM (
+  SELECT *, leadInFrame(ts) OVER (PARTITION BY node, src_ip, dst_port ORDER BY ts
+                                  ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS next_ts
+  FROM v2node.flows_latest
+  WHERE schema_version >= 4 AND kind = 'udp_flow' AND quic_initial = 'ok' AND ts > now() - INTERVAL 1 DAY
+)
+WHERE flow_pkts <= quic_initials
+ORDER BY ts DESC
+LIMIT 200;
+
+-- 9. QUIC：SNI 在第一个数据报里的分布（看客户端是否已做 SNI 切片），按版本与源/目的端口关系
+SELECT quic_ver, quic_sni_first, src_port > dst_port AS gfw_inspects, count() AS flows, uniqExact(src_ip) AS ips
+FROM v2node.flows_latest
+WHERE schema_version >= 4 AND kind = 'udp_flow' AND quic_initial = 'ok' AND ts > now() - INTERVAL 7 DAY
+GROUP BY quic_ver, quic_sni_first, gfw_inspects
+ORDER BY flows DESC;
 
 -- 7. 数据质量：最近一次各节点的采集统计（丢弃、截断、关联失败、内核丢包）
 SELECT node, max(ts) AS last_seen, argMax(message, ts) AS stats

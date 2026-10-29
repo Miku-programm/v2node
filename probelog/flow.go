@@ -73,6 +73,7 @@ type flow struct {
 	hsBadAck   bool  // 客户端段的 ACK 不可接受
 	hsNoAck    bool  // 客户端数据/FIN 没有 ACK 标志
 	srv        *reassembler
+	quic       *quicState // UDP：客户端 Initial 解析，结束后置空
 	respAt     time.Time
 	respFrozen bool
 	outPkts    uint32
@@ -601,11 +602,65 @@ func (t *flowTable) handleUDP(p *packet, now time.Time) []*Event {
 		f.base.QUICVer = quicVersion(p.payload)
 		f.firstSegDone = true
 		f.dataAt = now
+		if f.base.QUICVer != "" {
+			f.quic = newQUICState()
+		}
+	} else if f.quic != nil && now.Sub(f.dataAt) > firstFlightWait {
+		t.finishQUIC(f)
 	}
 	f.last, f.lastAny = now, now
 	f.pkts++
 	f.bytes += uint64(p.payloadWire)
+	if f.quic != nil {
+		f.quic.addDatagram(p.payload, p.truncated)
+		if st, _, _ := classifyHandshakeStream(f.quic.crypto.prefix()); st != tlsNeedMore || f.quic.datagrams >= quicMaxDatagrams {
+			t.finishQUIC(f)
+		}
+	}
 	return out
+}
+
+// finishQUIC 结束客户端 Initial 解析：写入 ClientHello 指纹、SNI 在第一个数据报中的覆盖情况，并释放缓存。
+// 结束条件：ClientHello 有结论、首个数据报后 2 秒、解析了 quicMaxDatagrams 个数据报，或流结束。
+func (t *flowTable) finishQUIC(f *flow) {
+	s := f.quic
+	if s == nil {
+		return
+	}
+	f.quic = nil
+	f.base.QUICInitial = s.status()
+	f.base.QUICInitials = uint8(min(s.initials, 255))
+	if !s.decrypted {
+		return
+	}
+	stream := s.crypto.prefix()
+	state, ch, used := classifyHandshakeStream(stream)
+	switch state {
+	case tlsNeedMore:
+		state = tlsIncomplete
+	case tlsComplete:
+		if s.crypto.conflictBefore(used) {
+			state = tlsConflict
+		}
+	}
+	f.base.TLSState = state
+	f.base.ReasmFlags = s.crypto.flagString()
+	switch state {
+	case tlsComplete:
+		fillTLSFor(&f.base, ch, 'q')
+		if ch.sni == "" {
+			f.base.QUICSNIFirst = QUICSNIFirstNoSNI
+		} else {
+			f.base.QUICSNIFirst = s.sniCoverage(ch.sniOff, ch.sniLen)
+		}
+	case tlsIncomplete:
+		t.r.stats.tlsIncomplete.Add(1)
+	case tlsMalformed:
+		t.r.stats.tlsMalformed.Add(1)
+	case tlsConflict:
+		t.r.stats.tlsConflict.Add(1)
+	}
+	t.r.stats.quicInitials.Add(1)
 }
 
 // handshakeState 根据观察到的证据给出握手状态
@@ -709,6 +764,7 @@ func (t *flowTable) keep(f *flow) bool {
 func (t *flowTable) appendSnapshot(out []*Event, f *flow) []*Event {
 	f.snapshotDone = true
 	t.finishPrefix(f, PrefixStopSnapshot)
+	t.finishQUIC(f)
 	t.freezeResponse(f)
 	if !t.keep(f) {
 		return out
@@ -723,6 +779,7 @@ func (t *flowTable) appendFinal(out []*Event, f *flow, end string, now time.Time
 		return out
 	}
 	t.finishPrefix(f, PrefixStopFlowEnd)
+	t.finishQUIC(f)
 	t.freezeResponse(f)
 	f.finalized = true
 	f.endAt = now
@@ -896,8 +953,11 @@ func (t *flowTable) sweep(now time.Time) {
 	// 先决定候选窗口已关闭的 access 记录，让同一轮输出的 final 带上结论
 	out := t.resolveLogs(now)
 	for k, f := range t.flows {
-		if !f.prefixDone && !f.dataAt.IsZero() && now.Sub(f.dataAt) > firstFlightWait {
-			t.finishPrefix(f, PrefixStopWindow)
+		if !f.dataAt.IsZero() && now.Sub(f.dataAt) > firstFlightWait {
+			if !f.prefixDone {
+				t.finishPrefix(f, PrefixStopWindow)
+			}
+			t.finishQUIC(f)
 		}
 		if !f.respFrozen && !f.respAt.IsZero() && now.Sub(f.respAt) > firstFlightWait {
 			t.freezeResponse(f)

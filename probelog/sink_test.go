@@ -137,7 +137,7 @@ func TestMigrationCoversNewColumns(t *testing.T) {
 		old[c] = true
 	}
 	var mig []byte
-	for _, f := range []string{"migrations/002_v2.sql", "migrations/003_v3.sql"} {
+	for _, f := range []string{"migrations/002_v2.sql", "migrations/003_v3.sql", "migrations/004_quic.sql"} {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatal(err)

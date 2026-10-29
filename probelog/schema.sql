@@ -1,6 +1,6 @@
--- v2node 探测日志 ClickHouse 表结构（新安装，schema_version = 3）
+-- v2node 探测日志 ClickHouse 表结构（新安装，schema_version = 4）
 -- 用法：clickhouse-client --multiquery < schema.sql
--- 已有表的升级按顺序执行 migrations/002_v2.sql（v1 表）、003_v3.sql（CREATE TABLE IF NOT EXISTS 不会升级已有表）
+-- 已有表的升级按顺序执行 migrations/002_v2.sql（v1 表）、003_v3.sql、004_quic.sql（CREATE TABLE IF NOT EXISTS 不会升级已有表）
 -- 字段含义见 README.md；查询示例见 queries.sql
 
 CREATE DATABASE IF NOT EXISTS v2node;
@@ -8,7 +8,7 @@ CREATE DATABASE IF NOT EXISTS v2node;
 CREATE TABLE IF NOT EXISTS v2node.probe_events
 (
     ts  DateTime64(3, 'UTC'),                   -- 事件时间；流记录为连接首次观察时间
-    schema_version  UInt16 DEFAULT 0,           -- 0/1 = v1 旧行；2 = v2；3 = 当前模型（语义差异见 README）
+    schema_version  UInt16 DEFAULT 0,           -- 0/1 = v1 旧行；2 = v2；3 = v3；4 = 当前模型（语义差异见 README）
     event_id  String,                           -- 记录唯一标识；流记录为 flow_id-revision
     emitted_at  DateTime64(3, 'UTC') DEFAULT ts, -- 记录生成时间
     node  LowCardinality(String),
@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS v2node.probe_events
     tls_ch_len  UInt32,
 
     quic_ver  LowCardinality(String),
+    quic_initial  LowCardinality(String),       -- v4，udp_flow：ok / unsupported_version / decrypt_failed / truncated / malformed / no_initial
+    quic_sni_first  LowCardinality(String),     -- v4：full / partial / none / no_sni，SNI 字节落在第一个 UDP 数据报里的程度
+    quic_initials  UInt8,                       -- v4：含可解密客户端 Initial 的数据报数
     icmp_type  UInt8,
     icmp_code  UInt8,
 

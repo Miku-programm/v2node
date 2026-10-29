@@ -79,9 +79,25 @@
 | `reasm_flags` | `gap`（后面有数据但中间缺字节）、`conflict`（重叠段内容不一致）、`overflow`（乱序队列或前缀达到上限）、`truncated`（有段因捕获长度丢了尾部）、`retrans`（收到内容一致的重复数据）。**只描述 `prefix_stop` 之前的观察**：之后到达的客户端字节不再检查，空值不代表整条连接都没有重叠冲突。重叠采用“先到达的字节优先”：每个位置第一次收到的字节（无论当时是否已接上连续前缀）保留，之后的只用于比较。这是采集器的确定规则，不一定是节点协议栈实际采用的字节 |
 | `tls_state` | `complete` / `not_client_hello` / `malformed` / `incomplete` / `conflict`。`malformed`：record 与 handshake 长度都齐了，但内部向量的声明长度与内容不符（越界、尾部多余、元素大小不对）或出现了其他记录；未知扩展按声明长度跳过，不算畸形。`incomplete`：前缀采集结束时仍没收齐（缺口、截断、超时、结束）。`conflict`：语法可以解析，但 ClientHello 所在字节范围内有内容不一致的重叠段，不输出指纹。**只有 `complete` 时 `tls_*`、`ja3`、`ja4` 才填写**；跨多个 TLS record 的 ClientHello 会拼起来解析。冲突只出现在 ClientHello 之后时仍是 `complete`，`reasm_flags` 保留 `conflict` |
 | `first_data_ms` | SYN 到首个数据段的毫秒数 |
+| `quic_initial` / `quic_sni_first` / `quic_initials` | 仅 `udp_flow`（v4 起）：解密 QUIC 客户端 Initial 的结果，见下节 |
 | `out_pkts` / `out_bytes` / `first_resp_ms` / `resp_records` | 仅 `full` 模式：节点方向的数据包统计、SYN 到节点首个数据段的毫秒数、节点响应前 8 个 TLS record 的 `类型:长度` |
 
 **截断**：入站带数据的包每包最多捕获 2048 字节（含 IP/TCP 头），`full` 模式的出站数据包 1024 字节。截断通过 IP 长度字段和内核报告的原始长度（`MSG_TRUNC`）检测，截断的段只放入实际捕获的字节，后续数据不会被拼到缺失位置。主机上看到的分段不一定等于线上的实际分段：GRO 会把多个入站段合并成大包（更容易被截断），出站在 TSO 分段前被捕获。
+
+## QUIC 客户端 Initial（`udp_flow`）
+
+QUIC Initial 包的密钥由公开的版本盐和客户端选的 Destination Connection ID 推导（RFC 9001 §5.2、RFC 9369），任何在路径上的观察者都能解密。GFW 自 2024 年 4 月起就是这样解密 Initial、按 SNI 封锁 QUIC 的（Zohaib et al., *Exposing and Circumventing SNI-based QUIC Censorship of the Great Firewall of China*, USENIX Security 2025）。采集器用同样的方法解析节点收到的客户端 Initial：
+
+- 首个数据报以 QUIC 长包头开头的 UDP 流才解析；支持 v1 和 v2、同一数据报中合并的多个包、多个 CRYPTO 帧乱序。按 CRYPTO 偏移重组 ClientHello（重叠冲突时先到达的字节优先，`reasm_flags` 记录 CRYPTO 流的质量标记）
+- 解析在 ClientHello 有结论、首个数据报 2 秒后、解析满 8 个数据报或流结束时停止
+- ClientHello 写入 `tls_state` / `tls_sni` / `tls_alpn` / `ja3` / `ja4`（JA4 以 `q` 开头）等字段，规则与 TCP 相同：只有 `complete` 才填写指纹
+- `quic_initial`：`ok`（至少一个 Initial 解密成功）、`unsupported_version`（不是 v1/v2，无法推导密钥）、`decrypt_failed`（AEAD 校验失败）、`truncated`（捕获截断）、`malformed`（包头或帧不合法）、`no_initial`（有长包头但没有客户端 Initial）
+- `quic_sni_first`：SNI 主机名的字节有多少落在**第一个 UDP 数据报**的 CRYPTO 帧里——`full` / `partial` / `none` / `no_sni`。论文观察到 GFW 不跨数据报重组，`full` 是 GFW 能读到 SNI 的情形；`partial` / `none` 对应客户端做了 SNI 切片（Firefox 137+、quic-go v0.52+、sing-box / Xray / Hysteria 的新版本）或 ClientHello 本身跨数据报
+- `quic_initials`：含有可解密客户端 Initial 的数据报数
+
+与 GFW 规则相关的另外两个量可以直接从已有列算：论文中 GFW 只检查**源端口 > 目的端口**的包（`src_port > dst_port`），并按（客户端 IP、节点 IP、目的端口）封锁约 180 秒，期间只丢客户端→节点方向。所以在节点上，被封的连接表现为：客户端发来 Initial 后不再有入站包（`flow_pkts` 接近 `quic_initials`），同一客户端 IP 到同一端口约 3 分钟没有新的流。查询示例见 `queries.sql` 第 8 条。
+
+这些只是**候选**：节点只能看到“包没到”，区分不了 GFW 封锁、链路丢包、客户端放弃或伪造源地址触发的封锁（论文第 6 节：从境内伪造 Initial 仍能让 GFW 封锁两个无关主机之间的 UDP）。确认需要境内对照测量。UDP 只抓入站，看不到节点的响应。
 
 ## 认证字段
 
@@ -107,7 +123,7 @@ xray access 记录只带来源地址，不带入站目标（`m.To` 是业务目�
 
 ## 数据质量统计（`kind=stats`）
 
-`rate_dropped`、`sampled_out`、`sink_chan_dropped`、`sink_buffer_dropped`（各种主动丢弃）；`flow_table_full`；`midstream_flows`；`tls_incomplete`、`tls_malformed`、`tls_conflict`；`reasm_conflict`、`reasm_overflow`、`cap_truncated`；`assoc_unmatched`、`assoc_ambiguous`、`pending_logs_dropped`、`pending_logs_expired`、`late_corrections`；`kernel_packets`、`kernel_drops`（来自 `PACKET_STATISTICS`，取不到时为 `"unavailable"`，**不是 0**）；`sink_schema`（启动时表结构检查结果）。
+`rate_dropped`、`sampled_out`、`sink_chan_dropped`、`sink_buffer_dropped`（各种主动丢弃）；`flow_table_full`；`midstream_flows`；`tls_incomplete`、`tls_malformed`、`tls_conflict`；`quic_initials`（解密成功并完成解析的 QUIC 流数）；`reasm_conflict`、`reasm_overflow`、`cap_truncated`；`assoc_unmatched`、`assoc_ambiguous`、`pending_logs_dropped`、`pending_logs_expired`、`late_corrections`；`kernel_packets`、`kernel_drops`（来自 `PACKET_STATISTICS`，取不到时为 `"unavailable"`，**不是 0**）；`sink_schema`（启动时表结构检查结果）。
 
 ## 配置
 
@@ -148,7 +164,7 @@ xray access 记录只带来源地址，不带入站目标（`m.To` 是业务目�
 ## ClickHouse
 
 - 新安装：`clickhouse-client --multiquery < probelog/schema.sql`
-- 从 v1 升级：依次执行 `migrations/002_v2.sql`、`migrations/003_v3.sql`；从 v2 升级：只执行 `003_v3.sql`。**先升级表、再升级节点**：节点不跳过未知字段，表结构落后时写入会直接失败，并在 `stats.sink_schema` 里列出缺少的列。
+- 从 v1 升级：依次执行 `migrations/002_v2.sql`、`003_v3.sql`、`004_quic.sql`；从 v2 升级：执行 `003_v3.sql`、`004_quic.sql`；从 v3 升级：只执行 `004_quic.sql`。**先升级表、再升级节点**：节点不跳过未知字段，表结构落后时写入会直接失败，并在 `stats.sink_schema` 里列出缺少的列。
 - 查询示例（取每个连接的最新记录、区分新旧语义等）：`probelog/queries.sql`
 - 去重：上传失败重试会发送完全相同的批次，表开启了 `non_replicated_deduplication_window`；查询时仍建议按 `flow_id` 取最大 `revision`、按 `event_id` 去重。
 - v2 行（`schema_version = 2`）与 v3 的差异，不要混在一起比较：非 TLS 前缀在首字节判断后就停止采集（长度取决于分段，没有 `prefix_stop`）；`tls_state=complete` 可能包含 ClientHello 内的重叠冲突和漏检的内部长度错误；`handshake=established` 只要有客户端数据或 FIN 就会给出（v3 中多为 `inferred`）；日志先到时会绑定第一个出现的连接，final 后的歧义没有 correction；`full` 模式下按入站包计时回收。旧行不会自动获得新语义保证。

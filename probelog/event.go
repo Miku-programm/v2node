@@ -3,8 +3,9 @@ package probelog
 import "time"
 
 // SchemaVersion 是事件模型版本。v1 为最初版本（无 flow_id），v2 起有连接实例、修订与质量字段；
-// v3 起前缀采集与 TLS 判别分开（prefix_stop）、handshake 区分已核对与推定（hs_flags）、tls_state 增加 conflict。
-const SchemaVersion = 3
+// v3 起前缀采集与 TLS 判别分开（prefix_stop）、handshake 区分已核对与推定（hs_flags）、tls_state 增加 conflict；
+// v4 起 udp_flow 解密 QUIC 客户端 Initial（quic_initial / quic_sni_first / quic_initials，并填写 tls_*）。
+const SchemaVersion = 4
 
 // 事件类型
 const (
@@ -145,9 +146,13 @@ type Event struct {
 	TLSSIDLn uint8  `json:"tls_sid_len,omitempty"`
 	TLSCHLen uint32 `json:"tls_ch_len,omitempty"`
 
-	QUICVer  string `json:"quic_ver,omitempty"`
-	ICMPType uint8  `json:"icmp_type,omitempty"`
-	ICMPCode uint8  `json:"icmp_code,omitempty"`
+	QUICVer string `json:"quic_ver,omitempty"`
+	// QUIC 客户端 Initial（v4 起，只有 udp_flow）：解密后 CRYPTO 帧里的 ClientHello 写入上面的 tls_* 字段，JA4 以 q 开头
+	QUICInitial  string `json:"quic_initial,omitempty"`   // ok / unsupported_version / decrypt_failed / truncated / malformed / no_initial
+	QUICSNIFirst string `json:"quic_sni_first,omitempty"` // full / partial / none / no_sni：SNI 字节落在第一个数据报里的程度
+	QUICInitials uint8  `json:"quic_initials,omitempty"`  // 含有可解密客户端 Initial 的数据报数（解析结束时）
+	ICMPType     uint8  `json:"icmp_type,omitempty"`
+	ICMPCode     uint8  `json:"icmp_code,omitempty"`
 
 	// 连接汇总。flow_ms / flow_pkts / flow_bytes 只统计入站（客户端→节点）数据包
 	FlowMs    uint32 `json:"flow_ms,omitempty"`

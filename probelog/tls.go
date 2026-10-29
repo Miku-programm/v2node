@@ -24,6 +24,9 @@ type clientHello struct {
 	sni       string
 	alpn      []string
 	length    int
+	msg       []byte // 正在解析的 handshake 消息（用于计算 SNI 偏移）
+	sniOff    int    // SNI 主机名在 handshake 消息中的偏移（含 4 字节头），没有 SNI 时为 0
+	sniLen    int
 }
 
 var errNotClientHello = errors.New("not a tls client hello")
@@ -104,6 +107,32 @@ func classifyClientHelloN(b []byte) (string, *clientHello, int) {
 	return tlsComplete, ch, used
 }
 
+// classifyHandshakeStream 判断不带 TLS record 层的 handshake 字节流（QUIC CRYPTO 流）是否是 ClientHello，
+// 同时返回 ClientHello 占用的字节数
+func classifyHandshakeStream(b []byte) (string, *clientHello, int) {
+	if len(b) == 0 {
+		return tlsNeedMore, nil, 0
+	}
+	if b[0] != 1 {
+		return tlsNotCH, nil, 0
+	}
+	if len(b) < 4 {
+		return tlsNeedMore, nil, 0
+	}
+	hsLen := int(b[1])<<16 | int(b[2])<<8 | int(b[3])
+	if hsLen > maxClientHelloBytes {
+		return tlsMalformed, nil, 0
+	}
+	if len(b) < hsLen+4 {
+		return tlsNeedMore, nil, 0
+	}
+	ch, err := parseHandshake(b[:hsLen+4])
+	if err != nil {
+		return tlsMalformed, nil, hsLen + 4
+	}
+	return tlsComplete, ch, hsLen + 4
+}
+
 // parseClientHello 解析完整的 ClientHello（测试与工具使用）
 func parseClientHello(b []byte) (*clientHello, error) {
 	state, ch := classifyClientHello(b)
@@ -133,7 +162,8 @@ func u16List(v []byte, min int) ([]uint16, error) {
 // 不是“还要等数据”。未知扩展按声明长度整体跳过。
 func parseHandshake(hs []byte) (*clientHello, error) {
 	hsLen := int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
-	ch := &clientHello{length: hsLen + 4}
+	ch := &clientHello{length: hsLen + 4, msg: hs}
+	defer func() { ch.msg = nil }()
 	r := reader{b: hs[4 : 4+hsLen]}
 	ch.legacyVer = r.u16()
 	r.skip(32)
@@ -186,6 +216,7 @@ func (ch *clientHello) parseExtension(typ uint16, data *reader) error {
 			}
 			if nt == 0 && ch.sni == "" {
 				ch.sni = string(name)
+				ch.sniOff, ch.sniLen = cap(ch.msg)-cap(name), len(name)
 			}
 		}
 	case 0x0010: // ALPN
@@ -293,7 +324,10 @@ func isAlnum(c byte) bool {
 }
 
 // ja4 计算 TCP 上 TLS ClientHello 的 JA4 指纹
-func (ch *clientHello) ja4() string {
+func (ch *clientHello) ja4() string { return ch.ja4For('t') }
+
+// ja4For 计算 JA4 指纹，transport 为 't'（TCP）或 'q'（QUIC）
+func (ch *clientHello) ja4For(transport byte) string {
 	ver := map[uint16]string{0x0304: "13", 0x0303: "12", 0x0302: "11", 0x0301: "10", 0x0300: "s3"}[ch.version()]
 	if ver == "" {
 		ver = "00"
@@ -327,7 +361,7 @@ func (ch *clientHello) ja4() string {
 			alpn = string([]byte{h[0], h[len(h)-1]})
 		}
 	}
-	a := fmt.Sprintf("t%s%s%02d%02d%s", ver, sni, min(len(ciphers), 99), min(len(exts), 99), alpn)
+	a := fmt.Sprintf("%c%s%s%02d%02d%s", transport, ver, sni, min(len(ciphers), 99), min(len(exts), 99), alpn)
 	slices.Sort(ciphers)
 	slices.Sort(extsNoSNI)
 	c := hexList(extsNoSNI)
@@ -337,13 +371,16 @@ func (ch *clientHello) ja4() string {
 	return a + "_" + hash12(hexList(ciphers)) + "_" + hash12(c)
 }
 
-// fillTLS 把 ClientHello 信息写入事件
-func fillTLS(e *Event, ch *clientHello) {
+// fillTLS 把 TCP 上的 ClientHello 信息写入事件
+func fillTLS(e *Event, ch *clientHello) { fillTLSFor(e, ch, 't') }
+
+// fillTLSFor 把 ClientHello 信息写入事件，transport 用于 JA4 第一位
+func fillTLSFor(e *Event, ch *clientHello, transport byte) {
 	e.TLSVer = tlsVersionName(ch.version())
 	e.TLSSNI = truncate(ch.sni, 255)
 	e.TLSALPN = truncate(strings.Join(ch.alpn, ","), 128)
 	e.JA3 = ch.ja3()
-	e.JA4 = ch.ja4()
+	e.JA4 = ch.ja4For(transport)
 	e.TLSSIDLn = uint8(ch.sidLen)
 	e.TLSCHLen = uint32(ch.length)
 }

@@ -57,6 +57,7 @@ type recorderStats struct {
 	tlsIncomplete      atomic.Uint64
 	tlsMalformed       atomic.Uint64
 	tlsConflict        atomic.Uint64
+	quicInitials       atomic.Uint64
 	reasmConflict      atomic.Uint64
 	reasmOverflow      atomic.Uint64
 	capTruncated       atomic.Uint64
@@ -224,6 +225,7 @@ func (r *Recorder) statsLoop() {
 				"tls_incomplete":       s.tlsIncomplete.Load(),
 				"tls_malformed":        s.tlsMalformed.Load(),
 				"tls_conflict":         s.tlsConflict.Load(),
+				"quic_initials":        s.quicInitials.Load(),
 				"reasm_conflict":       s.reasmConflict.Load(),
 				"reasm_overflow":       s.reasmOverflow.Load(),
 				"cap_truncated":        s.capTruncated.Load(),

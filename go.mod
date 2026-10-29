@@ -3,6 +3,7 @@ module github.com/wyx2685/v2node
 go 1.27.1
 
 require (
+	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-acme/lego/v4 v4.35.2
 	github.com/go-resty/resty/v2 v2.17.2
@@ -48,7 +49,6 @@ require (
 	github.com/alibabacloud-go/tea-utils/v2 v2.0.9 // indirect
 	github.com/aliyun/credentials-go v1.4.7 // indirect
 	github.com/andybalholm/brotli v1.1.0 // indirect
-	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.6 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.32.16 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.15 // indirect
