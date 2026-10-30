@@ -86,6 +86,8 @@ jobs:
       fail-fast: false
 
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}

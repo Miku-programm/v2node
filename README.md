@@ -30,9 +30,29 @@
 
 字段含义、观测模式、数据质量限制和 ClickHouse 建表 / 升级说明见 [probelog/README.md](probelog/README.md)。这些记录只描述“观察到了什么”，单独一条都不能证明来源是 GFW 或说明封锁因果。
 
-## 构建
+## 安装蜜罐节点
 
-需要 Go 1.27.1。
+先部署 ClickHouse 并用 [probelog/schema.sql](probelog/schema.sql) 建表（已有旧表按 `probelog/migrations/` 中的脚本依次升级），准备一个只有写入权限的账号。
+
+### 一键安装
+
+```bash
+wget -N https://raw.githubusercontent.com/Miku-programm/v2node/main/script/install.sh && bash install.sh
+```
+
+首次安装会询问面板地址、节点 ID、通讯密钥，以及 ClickHouse 地址、写入账号和节点名称。填写 ClickHouse 地址后生成的 `/etc/v2node/config.json` 会开启 ProbeLog（`Direction` 为 `control`，记录 22 端口和 `cn` 地区标记）；留空则不开启，之后需要手动补上。
+
+也可以用参数直接生成配置，跳过交互：
+
+```bash
+bash install.sh --api-host https://panel.example.com/ --node-id 1 --api-key 节点密钥   --clickhouse-url https://ch.example.com:8443 --clickhouse-user v2node_writer   --clickhouse-password 写入密码 --node-name hp-sg-1
+```
+
+安装指定版本：`bash install.sh v0.5.0`。安装后用 `v2node` 管理（`v2node log` 看日志，`v2node generate` 重新生成配置）。
+
+抓包需要 root 或 `CAP_NET_RAW`，只支持 Linux。其余配置项（观测模式、网卡、采样、限速等）见 [probelog/README.md](probelog/README.md#配置)。安装脚本不会向任何第三方统计服务上报。
+
+### 自行编译
 
 ```bash
 git clone https://github.com/Miku-programm/v2node.git
@@ -40,18 +60,9 @@ cd v2node
 GOEXPERIMENT=jsonv2 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -o build_assets/v2node -trimpath -ldflags "-X 'github.com/wyx2685/v2node/cmd.version=$version' -s -w -buildid="
 ```
 
-模块路径仍是上游的 `github.com/wyx2685/v2node`，不影响构建。抓包只支持 Linux，需要 root 或 `CAP_NET_RAW`。
+需要 Go 1.27.1。模块路径仍是上游的 `github.com/wyx2685/v2node`，不影响构建。编译后放到 `/usr/local/v2node/`，配置写在 `/etc/v2node/config.json`，以 systemd 服务运行 `/usr/local/v2node/v2node server`。
 
-## 部署
-
-本仓库暂未发布预编译版本，请自行编译后部署：
-
-1. 部署 ClickHouse，用 [probelog/schema.sql](probelog/schema.sql) 建表（已有旧表按 `probelog/migrations/` 中的脚本依次升级）。
-2. 把编译好的 `v2node` 放到 `/usr/local/v2node/`，配置写在 `/etc/v2node/config.json`，并在其中开启 `ProbeLog`、填写 ClickHouse 写入账号（示例见 [probelog/README.md](probelog/README.md#配置)）。
-3. 以 systemd 服务运行 `/usr/local/v2node/v2node server`。
-4. 部署 [probe-dashboard](https://github.com/Miku-programm/probe-dashboard) 查看数据。
-
-注意：`script/` 中的一键安装与管理脚本仍指向 gunzi-666/v2node 的发布版本，下载到的程序不包含 ProbeLog 和固定的 xray 版本，不要用它安装蜜罐节点。
+数据用 [probe-dashboard](https://github.com/Miku-programm/probe-dashboard) 查看。
 
 ## 致谢
 

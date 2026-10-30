@@ -107,7 +107,7 @@ before_show_menu() {
 }
 
 install() {
-    bash <(curl -Ls https://raw.githubusercontent.com/gunzi-666/v2node/main/script/install.sh)
+    bash <(curl -Ls https://raw.githubusercontent.com/Miku-programm/v2node/main/script/install.sh)
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -123,7 +123,7 @@ update() {
     else
         version=$2
     fi
-    bash <(curl -Ls https://raw.githubusercontent.com/gunzi-666/v2node/main/script/install.sh) $version
+    bash <(curl -Ls https://raw.githubusercontent.com/Miku-programm/v2node/main/script/install.sh) $version
     if [[ $? == 0 ]]; then
         echo -e "${green}更新完成，已自动重启 v2node，请使用 v2node log 查看运行日志${plain}"
         exit
@@ -307,7 +307,7 @@ show_log() {
 }
 
 update_shell() {
-    wget -O /usr/bin/v2node -N --no-check-certificate https://raw.githubusercontent.com/gunzi-666/v2node/main/script/v2node.sh
+    wget -O /usr/bin/v2node -N --no-check-certificate https://raw.githubusercontent.com/Miku-programm/v2node/main/script/v2node.sh
     if [[ $? != 0 ]]; then
         echo ""
         echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
@@ -420,10 +420,57 @@ show_v2node_version() {
     fi
 }
 
+# probelog_config_json 输出 ProbeLog 配置块（带前导逗号）；没有 ClickHouse 地址时输出空，ProbeLog 保持关闭
+probelog_config_json() {
+        local ch_url="$1"
+        local ch_user="$2"
+        local ch_pass="$3"
+        local node_name="$4"
+        if [[ -z "$ch_url" ]]; then
+            return
+        fi
+        cat <<EOF
+,
+    "ProbeLog": {
+        "Enable": true,
+        "NodeName": "${node_name}",
+        "Interface": "",
+        "Capture": true,
+        "Direction": "control",
+        "ExtraPorts": [22],
+        "GeoTags": ["cn"],
+        "XrayLogLevel": "info",
+        "ClickHouse": {
+            "URL": "${ch_url}",
+            "Database": "v2node",
+            "Table": "probe_events",
+            "Username": "${ch_user}",
+            "Password": "${ch_pass}"
+        }
+    }
+EOF
+}
+
+# read_probelog_args 交互式询问 ClickHouse 写入信息，结果放在 CH_URL / CH_USER / CH_PASS / PROBE_NODE_NAME
+read_probelog_args() {
+        echo -e "${yellow}蜜罐节点需要开启 ProbeLog，把探测记录写入 ClickHouse（表结构见仓库 probelog/schema.sql）${plain}"
+        read -rp "ClickHouse 地址[格式: https://ch.example.com:8443，留空则不开启 ProbeLog]: " CH_URL
+        if [[ -n "$CH_URL" ]]; then
+            read -rp "ClickHouse 写入用户名[默认 v2node_writer]: " CH_USER
+            CH_USER=${CH_USER:-v2node_writer}
+            read -rsp "ClickHouse 写入密码: " CH_PASS
+            echo ""
+            read -rp "节点名称（区分不同蜜罐）[默认 $(hostname)]: " PROBE_NODE_NAME
+            PROBE_NODE_NAME=${PROBE_NODE_NAME:-$(hostname)}
+        fi
+}
+
 generate_v2node_config() {
         local api_host="$1"
         local node_id="$2"
         local api_key="$3"
+        local probelog
+        probelog=$(probelog_config_json "$4" "$5" "$6" "$7")
 
         mkdir -p /etc/v2node >/dev/null 2>&1
         cat > /etc/v2node/config.json <<EOF
@@ -440,9 +487,13 @@ generate_v2node_config() {
             "ApiKey": "${api_key}",
             "Timeout": 15
         }
-    ]
+    ]${probelog}
 }
 EOF
+        chmod 600 /etc/v2node/config.json
+        if [[ -z "$4" ]]; then
+            echo -e "${yellow}未填写 ClickHouse 地址，ProbeLog 未开启。蜜罐节点需要在 /etc/v2node/config.json 中补上 ProbeLog 配置，见 probelog/README.md${plain}"
+        fi
         echo -e "${green}V2node 配置文件生成完成,正在重新启动服务${plain}"
         if [[ x"${release}" == x"alpine" ]]; then
             service v2node restart
@@ -467,9 +518,10 @@ generate_config_file() {
     read -rp "节点ID: " node_id
     node_id=${node_id:-1}
     read -rp "节点通讯密钥: " api_key
+    read_probelog_args
 
     # 生成配置文件（覆盖可能从包中复制的模板）
-    generate_v2node_config "$api_host" "$node_id" "$api_key"
+    generate_v2node_config "$api_host" "$node_id" "$api_key" "$CH_URL" "$CH_USER" "$CH_PASS" "$PROBE_NODE_NAME"
 }
 
 # 放开防火墙端口
@@ -513,7 +565,7 @@ show_usage() {
 show_menu() {
     echo -e "
   ${green}v2node 后端管理脚本，${plain}${red}不适用于docker${plain}
---- https://github.com/gunzi-666/v2node ---
+--- https://github.com/Miku-programm/v2node ---
   ${green}0.${plain} 修改配置
 ————————————————
   ${green}1.${plain} 安装 v2node

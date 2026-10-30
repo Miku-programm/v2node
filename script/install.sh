@@ -40,6 +40,10 @@ VERSION_ARG=""
 API_HOST_ARG=""
 NODE_ID_ARG=""
 API_KEY_ARG=""
+CH_URL=""
+CH_USER="v2node_writer"
+CH_PASS=""
+PROBE_NODE_NAME=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -50,8 +54,18 @@ parse_args() {
                 NODE_ID_ARG="$2"; shift 2 ;;
             --api-key)
                 API_KEY_ARG="$2"; shift 2 ;;
+            --clickhouse-url)
+                CH_URL="$2"; shift 2 ;;
+            --clickhouse-user)
+                CH_USER="$2"; shift 2 ;;
+            --clickhouse-password)
+                CH_PASS="$2"; shift 2 ;;
+            --node-name)
+                PROBE_NODE_NAME="$2"; shift 2 ;;
             -h|--help)
                 echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY]"
+                echo "          [--clickhouse-url URL] [--clickhouse-user USER] [--clickhouse-password PASS] [--node-name NAME]"
+                echo "填写 --clickhouse-url 时生成的配置会开启 ProbeLog（蜜罐节点必需）"
                 exit 0 ;;
             --*)
                 echo "未知参数: $1"; exit 1 ;;
@@ -218,10 +232,57 @@ check_status() {
     fi
 }
 
+# probelog_config_json 输出 ProbeLog 配置块（带前导逗号）；没有 ClickHouse 地址时输出空，ProbeLog 保持关闭
+probelog_config_json() {
+        local ch_url="$1"
+        local ch_user="$2"
+        local ch_pass="$3"
+        local node_name="$4"
+        if [[ -z "$ch_url" ]]; then
+            return
+        fi
+        cat <<EOF
+,
+    "ProbeLog": {
+        "Enable": true,
+        "NodeName": "${node_name}",
+        "Interface": "",
+        "Capture": true,
+        "Direction": "control",
+        "ExtraPorts": [22],
+        "GeoTags": ["cn"],
+        "XrayLogLevel": "info",
+        "ClickHouse": {
+            "URL": "${ch_url}",
+            "Database": "v2node",
+            "Table": "probe_events",
+            "Username": "${ch_user}",
+            "Password": "${ch_pass}"
+        }
+    }
+EOF
+}
+
+# read_probelog_args 交互式询问 ClickHouse 写入信息，结果放在 CH_URL / CH_USER / CH_PASS / PROBE_NODE_NAME
+read_probelog_args() {
+        echo -e "${yellow}蜜罐节点需要开启 ProbeLog，把探测记录写入 ClickHouse（表结构见仓库 probelog/schema.sql）${plain}"
+        read -rp "ClickHouse 地址[格式: https://ch.example.com:8443，留空则不开启 ProbeLog]: " CH_URL
+        if [[ -n "$CH_URL" ]]; then
+            read -rp "ClickHouse 写入用户名[默认 v2node_writer]: " CH_USER
+            CH_USER=${CH_USER:-v2node_writer}
+            read -rsp "ClickHouse 写入密码: " CH_PASS
+            echo ""
+            read -rp "节点名称（区分不同蜜罐）[默认 $(hostname)]: " PROBE_NODE_NAME
+            PROBE_NODE_NAME=${PROBE_NODE_NAME:-$(hostname)}
+        fi
+}
+
 generate_v2node_config() {
         local api_host="$1"
         local node_id="$2"
         local api_key="$3"
+        local probelog
+        probelog=$(probelog_config_json "$4" "$5" "$6" "$7")
 
         mkdir -p /etc/v2node >/dev/null 2>&1
         cat > /etc/v2node/config.json <<EOF
@@ -238,9 +299,13 @@ generate_v2node_config() {
             "ApiKey": "${api_key}",
             "Timeout": 15
         }
-    ]
+    ]${probelog}
 }
 EOF
+        chmod 600 /etc/v2node/config.json
+        if [[ -z "$4" ]]; then
+            echo -e "${yellow}未填写 ClickHouse 地址，ProbeLog 未开启。蜜罐节点需要在 /etc/v2node/config.json 中补上 ProbeLog 配置，见 probelog/README.md${plain}"
+        fi
         echo -e "${green}V2node 配置文件生成完成,正在重新启动服务${plain}"
         if [[ x"${release}" == x"alpine" ]]; then
             service v2node restart
@@ -267,13 +332,13 @@ install_v2node() {
     cd /usr/local/v2node/
 
     if  [[ -z "$version_param" ]] ; then
-        last_version=$(curl -Ls "https://api.github.com/repos/gunzi-666/v2node/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        last_version=$(curl -Ls "https://api.github.com/repos/Miku-programm/v2node/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [[ ! -n "$last_version" ]]; then
             echo -e "${red}检测 v2node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 v2node 版本安装${plain}"
             exit 1
         fi
         echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
-        url="https://github.com/gunzi-666/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
+        url="https://github.com/Miku-programm/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
         curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
@@ -281,7 +346,7 @@ install_v2node() {
         fi
     else
         last_version="v${version_param#v}"
-        url="https://github.com/gunzi-666/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
+        url="https://github.com/Miku-programm/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
         curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 v2node $1 失败，请确保此版本存在${plain}"
@@ -350,7 +415,7 @@ EOF
     if [[ ! -f /etc/v2node/config.json ]]; then
         # 如果通过 CLI 传入了完整参数，则直接生成配置并跳过交互
         if [[ -n "$API_HOST_ARG" && -n "$NODE_ID_ARG" && -n "$API_KEY_ARG" ]]; then
-            generate_v2node_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG"
+            generate_v2node_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG" "$CH_URL" "$CH_USER" "$CH_PASS" "${PROBE_NODE_NAME:-$(hostname)}"
             echo -e "${green}已根据参数生成 /etc/v2node/config.json${plain}"
             first_install=false
         else
@@ -375,7 +440,7 @@ EOF
     fi
 
 
-    curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/gunzi-666/v2node/main/script/v2node.sh
+    curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/Miku-programm/v2node/main/script/v2node.sh
     chmod +x /usr/bin/v2node
 
     cd $cur_dir
@@ -398,7 +463,6 @@ EOF
     echo "v2node uninstall    - 卸载 v2node"
     echo "v2node version      - 查看 v2node 版本"
     echo "------------------------------------------"
-    curl -fsS --max-time 10 "https://api.v-50.me/counter" || true
 
     if [[ $first_install == true ]]; then
         read -rp "检测到你为第一次安装 v2node，是否自动生成 /etc/v2node/config.json？(y/n): " if_generate
@@ -409,9 +473,10 @@ EOF
             read -rp "节点ID: " node_id
             node_id=${node_id:-1}
             read -rp "节点通讯密钥: " api_key
+            read_probelog_args
 
             # 生成配置文件（覆盖可能从包中复制的模板）
-            generate_v2node_config "$api_host" "$node_id" "$api_key"
+            generate_v2node_config "$api_host" "$node_id" "$api_key" "$CH_URL" "$CH_USER" "$CH_PASS" "$PROBE_NODE_NAME"
         else
             echo "${green}已跳过自动生成配置。如需后续生成，可执行: v2node generate${plain}"
         fi
@@ -419,6 +484,7 @@ EOF
 }
 
 parse_args "$@"
+echo -e "${red}注意：本程序仅用于蜜罐 / 探测研究节点，不可以作为机场节点运行常规业务${plain}"
 echo -e "${green}开始安装${plain}"
 install_base
 install_v2node "$VERSION_ARG"
