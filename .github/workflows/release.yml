@@ -2,6 +2,11 @@ name: Build and Release
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "上传到哪个已发布的版本（如 v0.5.0）；留空只编译不上传"
+        required: false
+        default: ""
   push:
     branches:
       - master
@@ -115,8 +120,14 @@ jobs:
         if: ${{ github.event_name == 'release' }}
         run: |
           echo "version=$(echo $GITHUB_REF | cut -d / -f 3)" >> $GITHUB_ENV
+      - name: Get dispatched release version
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          echo "version=$RELEASE_TAG" >> $GITHUB_ENV
       - name: Get other version
-        if: ${{ github.event_name != 'release' }}
+        if: ${{ github.event_name != 'release' && (github.event_name != 'workflow_dispatch' || inputs.release_tag == '') }}
         run: |
           echo "version=${{ github.sha }}" >> $GITHUB_ENV
       - name: Build v2node
@@ -171,9 +182,9 @@ jobs:
             ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}/*
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
-          tag: ${{ github.ref }}
+          tag: ${{ github.event_name == 'release' && github.ref || inputs.release_tag }}
           file_glob: true
