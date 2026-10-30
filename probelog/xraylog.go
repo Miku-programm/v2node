@@ -36,21 +36,16 @@ func (h *teeHandler) Handle(msg log.Message) {
 	if h.inner != nil {
 		h.inner.Handle(msg)
 	}
-	if r := current(); r != nil {
-		r.onXrayMessage(msg)
+	r := current()
+	if r == nil {
+		return
 	}
-}
-
-// Severity 取原 handler 与采集级别中更详细的一个，否则 xray 会在生成日志前就把 Info 级的 REALITY 日志过滤掉。
-// 原 handler 自己仍按原级别过滤，屏幕/文件日志不受影响。
-func (h *teeHandler) Severity() log.Severity {
-	s := log.Severity_Debug
-	if sl, ok := h.inner.(log.SeverityLogger); ok {
-		s = sl.Severity()
-	} else if h.inner == nil {
-		s = log.Severity_Unknown
+	// xray v26.7.28 不在生成日志前按级别过滤，所有日志都会送到 handler，由各 handler 自己过滤。
+	// 原 handler 仍按自己的级别输出，屏幕/文件日志不受影响；这里按 XrayLogLevel 决定采集哪些普通日志。
+	if m, ok := msg.(*log.GeneralMessage); ok && m.Severity > h.severity {
+		return
 	}
-	return max(s, h.severity)
+	r.onXrayMessage(msg)
 }
 
 // HookXrayLog 在 xray 实例启动后调用，接管日志 handler。记录器未启用时不做任何改动。

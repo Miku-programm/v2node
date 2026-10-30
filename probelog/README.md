@@ -1,5 +1,8 @@
 # 探测日志（ProbeLog）
 
+> [!CAUTION]
+> **仅用于蜜罐 / 探测研究节点，不可以在承载机场常规业务的节点上开启。** ProbeLog 会记录连接来源、TLS/QUIC 指纹、SNI 和首包内容并上传到 ClickHouse，用在真实用户的节点上等于采集用户的连接元数据。本仓库的 xray 内核固定为 v26.7.28，详见仓库根目录 README。
+
 记录节点收到的扫端口、连接和认证相关行为，批量写入 ClickHouse。数据用配套项目 [probe-dashboard](https://github.com/Miku-programm/probe-dashboard) 读取分析，v2node 本身不包含面板。
 
 **这里记录的是“观察到了什么”，不对来源、意图下结论。** 来源国家、SYN 扫描、`auth=unknown`、高熵载荷、相同 JA3/JA4 或相同前缀哈希，单独都不能说明是 GFW 探测；某条异常连接和之后节点不可达之间也不能直接当成因果。单个节点只能看到自己这一侧，要确认链路丢包或伪造 RST，还需要客户端侧的记录或受控实验。

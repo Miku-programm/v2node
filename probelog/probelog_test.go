@@ -780,3 +780,22 @@ func TestEventColumnsMatchSchema(t *testing.T) {
 		}
 	}
 }
+
+// xray v26.7.28 把所有级别的日志都送到 handler，采集按 XrayLogLevel 过滤普通日志，access 记录总是采集
+func TestXrayLogLevelFilter(t *testing.T) {
+	h := newHarness(t, ObsInbound, 1)
+	curMu.Lock()
+	prev := cur.Swap(h.r)
+	curMu.Unlock()
+	t.Cleanup(func() { cur.Store(prev) })
+	tee := &teeHandler{severity: parseSeverity("info")}
+	tee.Handle(&xlog.GeneralMessage{Severity: xlog.Severity_Debug, Content: "REALITY: debug detail"})
+	tee.Handle(&xlog.GeneralMessage{Severity: xlog.Severity_Info, Content: "REALITY: processed invalid connection"})
+	tee.Handle(&xlog.AccessMessage{From: "tcp:7.7.7.7:3333", To: "tcp:example.com:443", Status: xlog.AccessRejected})
+	if l := h.kind(KindXrayLog); len(l) != 1 || l[0].Severity != "info" {
+		t.Fatalf("xray logs: %+v", l)
+	}
+	if a := h.kind(KindXrayAccess); len(a) != 1 {
+		t.Fatalf("access: %+v", a)
+	}
+}
